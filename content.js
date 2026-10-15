@@ -78,7 +78,8 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       .replace(/\\+t/g, '\t')
       .replace(/\\+"/g, '"')
       .replace(/\\+\//g, '/')
-      .replace(/\\+(?=[^\s\\])/g, '')
+      // 非标准转义（LaTeX 的 \[ \frac 等）折叠为单个反斜杠而不是删除，否则公式会丢标识符。
+      .replace(/\\+(?=[^\s\\])/g, '\\')
       .replace(/\\$/gm, '');
 
     return text;
@@ -251,7 +252,7 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       }
 
       return urls
-        .map((url) => `[${assignNumber(url)}](${url})`)
+        .map((url) => `[[${assignNumber(url)}](${url})]`)
         .join('');
     });
 
@@ -259,7 +260,52 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       markdown: body,
       citationCount: Array.from(urlNumbers.keys()).length,
       sourceCount: Array.from(urlNumbers.keys()).length,
+      numberByUrl: urlNumbers,
     };
+  }
+
+  // 末尾追加参考文献列表：编号与正文内联引用一一对应（首个出现顺序）。
+  // 标题里的方括号直接去掉而不是转义——\[ 会再次撞上数学渲染器的行间公式定界符。
+  // 没有真实标题（如结构化快路径）时，用 URL 派生可读标题：host · 路径词。
+  function describeUrlForReference(rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      const host = parsed.hostname.replace(/^www\./i, '');
+      const segments = parsed.pathname.split('/').filter(Boolean).reverse();
+      for (const segment of segments) {
+        const cleaned = segment
+          .replace(/\.(?:html?|php|aspx?|jsp)$/i, '')
+          .replace(/[-_+.]+/g, ' ')
+          .replace(/%[0-9a-f]{2}/gi, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (!cleaned || /^[0-9a-f]{6,}$/i.test(cleaned.replace(/\s/g, ''))) continue;
+        if (/\d{5,}/.test(cleaned) && cleaned.replace(/[\d\s.]/g, '').length < 4) continue;
+        if (cleaned.length >= 3 && /[a-z]/i.test(cleaned)) {
+          return `${host} · ${cleaned}`;
+        }
+      }
+      return host;
+    } catch {
+      return '';
+    }
+  }
+
+  function buildReferencesMarkdown(numberByUrl, titleByUrl, bodyText) {
+    if (!(numberByUrl instanceof Map) || numberByUrl.size === 0) return '';
+    if (/(?:^|\n)#{1,4}\s*(?:references?|参考文献|sources?(?:\s+(?:and|与)\s+(?:activity|活动))?|来源(?:与活动)?|引用来源)\s*$/im.test(String(bodyText || ''))) {
+      return '';
+    }
+    const hasCJK = /[\u3400-\u9fff]/.test(String(bodyText || ''));
+    const heading = hasCJK ? '## 参考文献' : '## References';
+    const entries = Array.from(numberByUrl.entries()).map(([url, number]) => {
+      const rawTitle = titleByUrl instanceof Map ? String(titleByUrl.get(url) || '').trim() : '';
+      const label = rawTitle && rawTitle !== url
+        ? rawTitle.replace(/[[\]]/g, ' ').replace(/\s+/g, ' ').trim()
+        : describeUrlForReference(url);
+      return `- [[${number}](${url})]${label ? ` ${label}` : ''}`;
+    });
+    return `\n${heading}\n\n${entries.join('\n')}\n`;
   }
 
   function extractStructuredReport(titlePrefix = '', sourceUrl = location.href) {
@@ -285,8 +331,13 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     );
 
     const frontMatter = buildFrontMatter(title, sourceUrl);
+    const referencesMarkdown = buildReferencesMarkdown(
+      citationReplacement.numberByUrl,
+      null,
+      citationReplacement.markdown,
+    );
     const markdownBodyWithTitle = sanitizeMermaidBlocks(
-      citationReplacement.markdown.replace(/^#\s+.+$/m, `# ${title}`),
+      citationReplacement.markdown.replace(/^#\s+.+$/m, `# ${title}`) + referencesMarkdown,
     );
     const markdown = collapseBlankLines(`${frontMatter}${markdownBodyWithTitle}`) + '\n';
     const warnings = [];
@@ -1532,6 +1583,28 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     return best;
   }
 
+  // 直接对话页识别失败时，把页面状态带进错误信息，便于区分“没开全屏”与“页面结构变了”。
+  function describeFullscreenDiagnostics() {
+    const layerCount = Array.from(document.querySelectorAll(FULLSCREEN_LAYER_SELECTOR))
+      .filter((node) => isFullscreenLayer(node)).length;
+    const containerCount = document.querySelectorAll(
+      '[data-testid*="deep-research" i], [data-testid*="research-report" i], [data-testid*="report-view" i]',
+    ).length;
+    const reportIframes = Array.from(document.querySelectorAll('iframe[src]'))
+      .filter((node) => /deep-research|oaiusercontent\.com/i.test(node.getAttribute('src') || ''));
+    const iframeHosts = [...new Set(reportIframes.map((node) => {
+      try {
+        return new URL(node.getAttribute('src'), location.href).hostname;
+      } catch {
+        return '';
+      }
+    }).filter(Boolean))];
+    const iframeSummary = reportIframes.length > 0
+      ? `报告 iframe ${reportIframes.length}（${iframeHosts.join('、') || '未知域名'}）`
+      : '报告 iframe 0';
+    return `（诊断：全屏层 ${layerCount}，报告容器 ${containerCount}，${iframeSummary}）`;
+  }
+
   function findReportRootFromAssistantMessages(main) {
     const messages = Array.from(main.querySelectorAll('[data-message-author-role="assistant"]'));
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -1759,18 +1832,24 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     if (ids.length === 0) {
       return normalizeText(element.textContent || '');
     }
+    // 引用统一输出为 [[N](url)]（括号在链接外侧）：渲染后是带中括号的 [N]，连续引用
+    // 不会粘连成一串数字；不能用 \[ 转义，否则数学渲染器会把 \[N\] 当成行间公式块。
     return ids
       .flatMap((id) => sourceGroups.get(id))
-      .map((source) => `[${source.index}](${source.url})`)
+      .map((source) => `[[${source.index}](${source.url})]`)
       .join('');
   }
 
   function renumberCitationLinks(markdown) {
     const numberByUrl = new Map();
-    return String(markdown || '').replace(/\[\d+\]\((https?:\/\/[^)]+)\)/g, (match, url) => {
-      if (!numberByUrl.has(url)) numberByUrl.set(url, numberByUrl.size + 1);
-      return `[${numberByUrl.get(url)}](${url})`;
+    // 兼容 [[N](url)] 新格式与 [\[N\]](url)、[N](url) 两种旧格式，统一重排为新格式。
+    const citationLinkPattern = /\[\[(\d+)\]\((https?:\/\/[^)]+)\)\]|\[(?:\\\[(\d+)\\\]|(\d+))\]\((https?:\/\/[^)]+)\)/g;
+    const renumbered = String(markdown || '').replace(citationLinkPattern, (_match, nested, nestedUrl, _bracketed, _plain, url) => {
+      const target = nestedUrl || url;
+      if (!numberByUrl.has(target)) numberByUrl.set(target, numberByUrl.size + 1);
+      return `[[${numberByUrl.get(target)}](${target})]`;
     });
+    return { markdown: renumbered, numberByUrl };
   }
 
   function textFromChildren(element, context) {
@@ -1814,8 +1893,12 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       if (!href || rawHref.startsWith('#') || !isExternalUrl(href)) {
         return text;
       }
-      if (/^\[\d{1,3}\]$/.test(text)) {
-        return `${text}(${href})`;
+      const bracketedNumber = text.match(/^\[(\d{1,3})\]$/);
+      if (bracketedNumber) {
+        return `[[${bracketedNumber[1]}](${href})]`;
+      }
+      if (/^\d{1,3}$/.test(text)) {
+        return `[[${text}](${href})]`;
       }
       return `[${text}](${href})`;
     }
@@ -2029,7 +2112,7 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     const root = directConversation ? findReportRootFromFullscreenLayer() : findReportRoot();
     if (!root) {
       if (directConversation) {
-        throw new Error('没有识别到当前全屏报告。请先将目标报告打开为全屏视图，再点击开始识别。');
+        throw new Error(`没有识别到当前全屏报告。请先将目标报告打开为全屏视图，再点击开始识别。${describeFullscreenDiagnostics()}`);
       }
       const structured = extractStructuredReport(titlePrefix, sourceUrl);
       if (structured) return structured;
@@ -2055,11 +2138,14 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       }
     }
 
-    const markdownBody = renumberCitationLinks(
+    const renumbered = renumberCitationLinks(
       renderChildren(root, { sourcesByCitationIndex, skipTitleElement: titleElement }),
     );
-    const markdown = finalizeMarkdown(markdownBody, sources, title, sourceUrl);
-    const citationMatches = markdownBody.match(/\[\d+\]\(https?:\/\/[^)]+\)/g) || [];
+    const markdownBody = renumbered.markdown;
+    const titleByUrl = new Map(sources.map((source) => [source.url, source.title || '']));
+    const referencesMarkdown = buildReferencesMarkdown(renumbered.numberByUrl, titleByUrl, markdownBody);
+    const markdown = finalizeMarkdown(`${markdownBody}${referencesMarkdown}`, sources, title, sourceUrl);
+    const citationMatches = markdownBody.match(/\[\[\d+\]\(https?:\/\/[^)]+\)\]|\[(?:\\\[\d+\\\]|\d+)\]\(https?:\/\/[^)]+\)/g) || [];
 
     const warnings = [];
     if (sources.length === 0) {
@@ -2146,6 +2232,13 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     }
     if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') {
       sendResponse({ ok: true, openedSources: maybeOpenSourcesPanels() });
+      return undefined;
+    }
+    if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {
+      // 供快路径比对当前打开的报告标题；只做轻量 DOM 查询，不触碰 citation 轮播。
+      const root = isDirectConversationPage() ? findReportRootFromFullscreenLayer() : findReportRoot();
+      const heading = root ? (findTitleElement(root) || root.querySelector('h1')) : null;
+      sendResponse({ ok: true, heading: normalizeText(heading?.textContent || '') });
       return undefined;
     }
     if (message?.type !== 'DEEP_RESEARCH_EXPORT_MARKDOWN') return undefined;

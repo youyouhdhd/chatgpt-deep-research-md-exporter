@@ -30,10 +30,11 @@ async function reloadExtensionOnce() {
 
 async function sendExportMessage(tab) {
   const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id }) || [];
-  const deepResearchHost = 'connector-openai-deep-research.web-sandbox.oaiusercontent.com';
+  // 与 popup.js 保持一致：报告沙箱域名可能调整，按特征识别而不是写死单一 host。
+  const isReportFrameUrl = (url) => /deep-research|web-sandbox\.oaiusercontent\.com/i.test(String(url || ''));
   const orderedFrames = frames.sort((left, right) => {
-    const leftReport = String(left.url || '').includes(deepResearchHost) ? 1 : 0;
-    const rightReport = String(right.url || '').includes(deepResearchHost) ? 1 : 0;
+    const leftReport = isReportFrameUrl(left.url) ? 1 : 0;
+    const rightReport = isReportFrameUrl(right.url) ? 1 : 0;
     if (leftReport !== rightReport) return rightReport - leftReport;
     if (left.frameId === 0) return 1;
     if (right.frameId === 0) return -1;
@@ -247,14 +248,19 @@ async function runDiagnostic() {
     structuredAttempts: diagnostic.structuredAttempts,
     result: diagnostic.response.result,
   }, null, 2);
-  const url = URL.createObjectURL(new Blob([payload], { type: 'application/json;charset=utf-8' }));
-  await chrome.downloads.download({
-    url,
-    filename: 'chatgpt-exporter-diagnostic.json',
-    conflictAction: 'uniquify',
-    saveAs: false,
-  });
-  window.setTimeout(() => URL.revokeObjectURL(url), 30000);
+  // Chrome 忽略 chrome.downloads.download 的 filename 参数，改用 anchor download 属性命名。
+  const bytes = new TextEncoder().encode(payload);
+  let binary = '';
+  for (let index = 0; index < bytes.length; index += 8192) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 8192));
+  }
+  const dataUrl = `data:application/json;charset=utf-8;base64,${btoa(binary)}`;
+  const anchor = document.createElement('a');
+  anchor.href = dataUrl;
+  anchor.download = 'chatgpt-exporter-diagnostic.json';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
   setStatus('Diagnostic downloaded');
 }
 

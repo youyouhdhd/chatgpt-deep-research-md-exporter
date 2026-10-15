@@ -181,6 +181,8 @@ function countLatexDisplayDelimiters(markdown) {
 function looksLikeBareLatexFormula(formula) {
   const text = String(formula || '').trim();
   if (!text || /^https?:\/\//i.test(text)) return false;
+  // 引用链接（形如 [N](url)）不是公式，即使 URL 里带下划线等公式特征字符。
+  if (/\]\(/.test(text) || /https?:\/\//i.test(text)) return false;
   return (
     /\\[A-Za-z]+/.test(text)
     || /[_^]\s*(?:\{|[A-Za-z0-9])/.test(text)
@@ -259,6 +261,61 @@ function isDirectConversationUrl(url) {
   }
 }
 
+function normalizedCompareText(value) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/[：:]+$/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function titlesReferToSameReport(candidate, heading) {
+  const left = normalizedCompareText(candidate);
+  const right = normalizedCompareText(heading);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  // 渲染出来的标题可能被截断或追加了说明文字，双向包含即视为同一份报告。
+  const shorter = left.length < right.length ? left : right;
+  const longer = left.length < right.length ? right : left;
+  return shorter.length >= 6 && longer.includes(shorter);
+}
+
+async function tryStructuredFastPath(tab, message, orderedFrameIds) {
+  let structured = null;
+  try {
+    structured = await chrome.tabs.sendMessage(tab.id, {
+      type: 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT',
+      titlePrefix: message?.titlePrefix,
+      sourceUrl: message?.sourceUrl,
+    }, { frameId: 0 });
+  } catch {
+    return null;
+  }
+  if (!structured?.ok || !structured?.result?.markdown) return null;
+
+  // citation 映射未命中时 payload 数据不完整，交给 DOM 路径兜底。
+  const citationCount = Number(structured.result.citationCount) || 0;
+  if (citationCount === 0) return null;
+
+  const prefix = String(message?.titlePrefix || '').trim();
+  const rawTitle = String(structured.result.title || '');
+  const candidate = prefix && rawTitle.startsWith(prefix) ? rawTitle.slice(prefix.length) : rawTitle;
+  if (!normalizedCompareText(candidate)) return null;
+
+  // 与当前打开的全屏报告标题比对，确认 payload 里的报告就是用户打开的那一份。
+  for (const frameId of orderedFrameIds) {
+    try {
+      const headingResponse = await chrome.tabs.sendMessage(tab.id, {
+        type: 'DEEP_RESEARCH_REPORT_HEADING',
+      }, { frameId });
+      if (titlesReferToSameReport(candidate, headingResponse?.heading)) {
+        return structured;
+      }
+    } catch {}
+  }
+  return null;
+}
+
 async function sendExportMessage(tab, message) {
   if (!isDirectConversationUrl(tab.url) || !chrome.webNavigation?.getAllFrames) {
     return chrome.tabs.sendMessage(tab.id, message);
@@ -269,12 +326,13 @@ async function sendExportMessage(tab, message) {
     frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id }) || [];
   } catch {}
 
-  const deepResearchHost = 'connector-openai-deep-research.web-sandbox.oaiusercontent.com';
+  // ChatGPT 的报告沙箱域名可能调整；按特征识别报告 frame，而不是写死单一 host。
+  const isReportFrameUrl = (url) => /deep-research|web-sandbox\.oaiusercontent\.com/i.test(String(url || ''));
   const orderedFrameIds = frames
     .sort((left, right) => {
-      const leftDeepResearch = String(left.url || '').includes(deepResearchHost) ? 1 : 0;
-      const rightDeepResearch = String(right.url || '').includes(deepResearchHost) ? 1 : 0;
-      if (leftDeepResearch !== rightDeepResearch) return rightDeepResearch - leftDeepResearch;
+      const leftReport = isReportFrameUrl(left.url) ? 1 : 0;
+      const rightReport = isReportFrameUrl(right.url) ? 1 : 0;
+      if (leftReport !== rightReport) return rightReport - leftReport;
       if (left.frameId === 0) return 1;
       if (right.frameId === 0) return -1;
       return left.frameId - right.frameId;
@@ -298,20 +356,35 @@ async function sendExportMessage(tab, message) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
   }
 
-  let lastResponse = null;
+  // 快路径：顶层页面的内嵌 payload 含报告原始 Markdown（LaTeX 完整）与完整引用映射，
+  // 标题与当前全屏报告一致时直接采用，避免逐个打开 citation 轮播（上百处引用需一两分钟）。
+  if (message?.type === 'DEEP_RESEARCH_EXPORT_MARKDOWN') {
+    const fastResponse = await tryStructuredFastPath(tab, message, orderedFrameIds);
+    if (fastResponse) return fastResponse;
+  }
+
   let lastError = null;
+  const failedResponses = [];
   // Deep Research 正文位于跨域 iframe；逐帧请求可避免顶层错误抢先覆盖正确结果。
   for (const frameId of orderedFrameIds) {
     try {
       const response = await chrome.tabs.sendMessage(tab.id, message, { frameId });
       if (response?.ok) return response;
-      if (response) lastResponse = response;
+      if (response) failedResponses.push(response);
     } catch (error) {
       lastError = error;
     }
   }
 
-  if (lastResponse) return lastResponse;
+  if (failedResponses.length > 0) {
+    // 跨域报告 frame 排在最前，其错误最接近真实原因；与其余 frame 的错误去重后合并展示。
+    const errors = [];
+    for (const response of failedResponses) {
+      const messageText = String(response?.error || '').trim();
+      if (messageText && !errors.includes(messageText)) errors.push(messageText);
+    }
+    return { ok: false, error: errors.join('｜') || null };
+  }
   throw lastError || new Error(t('generic_export_failed'));
 }
 
@@ -345,9 +418,27 @@ async function requestExport(force = false) {
   return response.result;
 }
 
-function buildDownloadUrl(markdown) {
-  const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
-  return URL.createObjectURL(blob);
+function buildDownloadDataUrl(markdown) {
+  const bytes = new TextEncoder().encode(String(markdown || ''));
+  // 大报告分块转 base64，避免 String.fromCharCode 一次展开超限。
+  const CHUNK_SIZE = 8192;
+  let binary = '';
+  for (let index = 0; index < bytes.length; index += CHUNK_SIZE) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + CHUNK_SIZE));
+  }
+  return `data:text/markdown;charset=utf-8;base64,${btoa(binary)}`;
+}
+
+// Chrome 会忽略 chrome.downloads.download 的 filename 参数（blob 会被存成
+// blob UUID 文件名），而 anchor 的 download 属性可以正确命名；data URL 自包含，
+// 即使“另存为”对话框导致扩展弹窗关闭，下载也能完成。
+function triggerNamedDownload(url, filename) {
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
 }
 
 function sanitizeFilename(name) {
@@ -360,6 +451,50 @@ function sanitizeFilename(name) {
   return `${cleaned || 'deep-research-report'}.md`;
 }
 
+function cleanConversationTitle(rawTitle) {
+  let text = String(rawTitle || '').trim();
+  if (!text) return '';
+  text = text
+    .replace(/\s*[|–—-]\s*ChatGPT\s*$/i, '')
+    .replace(/^\s*ChatGPT\s*[|–—-]\s*/i, '')
+    .trim();
+  if (!text || /^(chatgpt|new chat|新的聊天)$/i.test(text)) return '';
+  return text;
+}
+
+function looksLikeMachineIdentifier(text) {
+  const value = String(text || '').trim();
+  if (!value) return true;
+  // 会话 UUID、无空格的长字母数字横线串等机器标识不适合当文件名，应退回报告标题。
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) return true;
+  if (value.length >= 16 && /^[0-9a-z_-]+$/i.test(value)) return true;
+  const digits = (value.match(/\d/g) || []).length;
+  const alnum = (value.match(/[0-9a-z]/gi) || []).length;
+  if (value.length >= 16 && digits >= 4 && alnum === value.length) return true;
+  return false;
+}
+
+function formatFileTimestamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return [
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    `${pad(date.getHours())}-${pad(date.getMinutes())}`,
+  ].join('_');
+}
+
+// 文件名优先使用插件识别出的报告标题（与检测摘要一致、最可靠）；
+// 识别标题缺失时退回会话标题，且会话标题形似机器 ID 时不用。
+function buildDownloadFilename(tab, result) {
+  const reportTitle = String(result?.title || '').trim();
+  const conversationTitle = cleanConversationTitle(tab?.title);
+  const base = reportTitle
+    || (conversationTitle && !looksLikeMachineIdentifier(conversationTitle)
+      ? `${currentPrefix()}${conversationTitle}`
+      : '')
+    || 'Deep Research Report';
+  return sanitizeFilename(`${base}_${formatFileTimestamp()}`);
+}
+
 async function downloadMarkdown() {
   setBusy(true);
   setStatus(t('status_generating'));
@@ -369,13 +504,9 @@ async function downloadMarkdown() {
     renderSummary(result);
     renderWarnings(result.warnings);
 
-    const url = buildDownloadUrl(result.markdown);
-    await chrome.downloads.download({
-      url,
-      filename: sanitizeFilename(result.filename),
-      saveAs: true,
-    });
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    const tab = await getActiveTab();
+    const filename = buildDownloadFilename(tab, result);
+    triggerNamedDownload(buildDownloadDataUrl(result.markdown), filename);
     setStatus(t('status_download_started'));
   } catch (error) {
     setStatus(error instanceof Error ? error.message : String(error || t('generic_download_failed')));

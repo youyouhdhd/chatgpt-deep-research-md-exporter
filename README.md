@@ -17,7 +17,7 @@ Search-friendly names:
 - Works directly in a specific ChatGPT conversation; no shared link is required
 - Exports only the currently open full-screen report on direct conversation pages
 - Keeps legacy structured extraction for compatible shared pages
-- Resolves ChatGPT internal research citations into inline Markdown links like `[2](url)`
+- Resolves ChatGPT internal research citations into inline Markdown links in the form `[[2](url)]` (brackets outside the link), which renders as a bracketed `[2]`; consecutive citations stay visually separated instead of merging into a digit run, and no `\[` escapes are emitted so math renderers cannot mistake citations for display formulas
 - Expands a merged citation into every source card actually present in its carousel, while keeping single-source citations single
 - Preserves citation links inside Markdown tables
 - Opens ChatGPT's `Show code` view to export Mermaid source instead of rendered SVG markup
@@ -55,14 +55,19 @@ This extension rebuilds the report from the currently open conversation page, so
 
 ## Output Behavior
 
+- The report is rebuilt from the page's embedded data stream first (seconds, keeps original LaTeX delimiters and the full citation map); the slower per-citation carousel DOM walk only runs when the embedded data is missing or does not match the open report
+- Downloaded files are named `report title + export time`, e.g. `gpt-Report Title_2026-10-13_19-30.md`; the report title detected by the extension is used first, and the ChatGPT tab title is only used as a fallback when it is meaningful (not empty and not a machine identifier such as a conversation ID)
 - The exported title can be prefixed, default `gpt-`
-- Inline citations are converted to Markdown links
+- Inline citations are converted to Markdown links in the form `[[N](url)]`, which renders as a bracketed `[N]`
+- Citation numbers are renumbered to a contiguous sequence by first appearance; ChatGPT's own citation indexes are conversation-wide and can skip numbers (e.g. 50 → 103), so gaps do not survive the export
+- A references list is appended at the end (`## References` / `## 参考文献` depending on the report language); each entry is numbered to match the inline citations, links to its source URL, and shows the source title when available, or a readable URL-derived title (`host · path words`) otherwise
 - Multiple source cards attached to one citation are exported as distinct numbered links
 - Domain-group headers are ignored so unrelated same-domain URLs are not attached to a citation
 - Mermaid diagrams are exported from their source-code view
 - Full-screen report content is preferred over the surrounding conversation
 - User prompts, the composer, and unrelated assistant replies are excluded
 - Optional LaTeX correction converts `\[ ... \]` and math-only `[ ... ]` display delimiters while leaving Markdown links, plain bracketed text, and code blocks intact
+- Downloads are triggered through an anchor's `download` attribute with a self-contained data URL, which names the file reliably (Chrome ignores the `filename` option of `chrome.downloads.download`, which used to produce blob-UUID file names); the file still downloads correctly even when the Save As dialog closes the popup
 
 ## Files
 
@@ -70,6 +75,7 @@ This extension rebuilds the report from the currently open conversation page, so
 - `popup.html` / `popup.css` / `popup.js`: popup UI and export actions
 - `content.js`: extraction, citation resolution, and Markdown generation
 - `page-bridge.js`: narrowly scoped bridge for ChatGPT's citation tooltip controls
+- `diagnostic.html` / `diagnostic.js`: one-click real-page diagnostic exporter used for troubleshooting
 
 ## Notes
 

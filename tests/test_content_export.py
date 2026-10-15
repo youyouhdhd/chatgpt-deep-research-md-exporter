@@ -274,9 +274,62 @@ class ContentExportTest(unittest.TestCase):
         result = response["result"]
         self.assertEqual(result["sourceCount"], 2)
         self.assertEqual(result["citationCount"], 2, result["markdown"])
-        self.assertIn("[1](https://alpha.example/study)", result["markdown"])
-        self.assertIn("[2](https://beta.example/paper)", result["markdown"])
+        self.assertIn(r"[[1](https://alpha.example/study)]", result["markdown"])
+        self.assertIn(r"[[2](https://beta.example/paper)]", result["markdown"])
         self.assertNotIn("uncited.example", result["markdown"])
+
+    def test_renumbers_sparse_chatgpt_indexes_and_appends_references(self):
+        # ChatGPT 的 citation 编号是会话级连续的（中间 51-102 属于其他消息），
+        # 导出必须重排为连续编号，并在末尾附上与正文编号一致的参考文献列表。
+        body = f"""
+        <!doctype html><html><body>
+          <button aria-label="Sources and activity" aria-expanded="false" onclick="setTimeout(() => {{
+            const panel = document.createElement('aside');
+            panel.innerHTML = `
+              <div role='tabpanel'>
+                <section aria-labelledby='report-references-citations'>
+                  <p id='report-references-citations'>Citations · 2</p>
+                  <div role='button' aria-label='Open source 50'>
+                    <button data-citation-index='50'>50</button>
+                    <a href='https://alpha.example/sparse'>Sparse alpha study</a>
+                  </div>
+                  <div role='button' aria-label='Open source 103'>
+                    <button data-citation-index='103'>103</button>
+                    <a href='https://beta.example/sparse'>Sparse beta paper</a>
+                  </div>
+                </section>
+              </div>
+            `;
+            document.body.appendChild(panel);
+          }}, 350)"></button>
+          <main>
+            <h1>Sparse Index Report</h1>
+            <h2>Evidence</h2>
+            <p>{long_paragraph('SPARSE INDEX REPORT')}</p>
+            <p>First <sup data-citation-index="50">50</sup>; second <sup data-citation-index="103">103</sup>.</p>
+            <h2>Conclusion</h2>
+            <p>{long_paragraph('SPARSE INDEX CONCLUSION')}</p>
+          </main>
+        </body></html>
+        """
+        frame_url = "https://connector-openai-deep-research.web-sandbox.oaiusercontent.com/report"
+
+        response = export_fixture(self.page, body, frame_url)
+
+        self.assertTrue(response["ok"])
+        result = response["result"]
+        markdown = result["markdown"]
+        # 正文编号重排为连续的 1、2，且不再出现 ChatGPT 的稀疏编号
+        self.assertIn(r"First [[1](https://alpha.example/sparse)]", markdown)
+        self.assertIn(r"second [[2](https://beta.example/sparse)]", markdown)
+        self.assertNotIn("[[50]", markdown)
+        self.assertNotIn("[[103]", markdown)
+        # 末尾参考文献列表与正文编号一致；慢速路径用来源面板里的真实标题
+        self.assertIn("## References", markdown)
+        self.assertIn(r"- [[1](https://alpha.example/sparse)] Sparse alpha study", markdown)
+        self.assertIn(r"- [[2](https://beta.example/sparse)] Sparse beta paper", markdown)
+        self.assertGreater(markdown.index("## References"), markdown.index("SPARSE INDEX CONCLUSION"))
+        self.assertTrue(result["sourceCount"] >= 2)
 
     def test_expands_one_fullscreen_citation_into_multiple_source_links(self):
         body = f"""
@@ -321,10 +374,10 @@ class ContentExportTest(unittest.TestCase):
         self.assertEqual(result["sourceCount"], 3)
         self.assertEqual(result["citationCount"], 3, result["markdown"])
         self.assertIn(
-            "Merged evidence [1](https://alpha.example/study)[2](https://beta.example/paper).",
+            r"Merged evidence [[1](https://alpha.example/study)][[2](https://beta.example/paper)].",
             result["markdown"],
         )
-        self.assertIn("Other evidence [3](https://gamma.example/result).", result["markdown"])
+        self.assertIn(r"Other evidence [[3](https://gamma.example/result)].", result["markdown"])
 
     def test_renders_every_citation_inside_a_numeric_span_group(self):
         body = f"""
@@ -361,11 +414,11 @@ class ContentExportTest(unittest.TestCase):
         result = response["result"]
         self.assertEqual(result["citationCount"], 4, result["markdown"])
         self.assertIn(
-            "Combined evidence [1](https://alpha.example/study)[2](https://beta.example/paper).",
+            r"Combined evidence [[1](https://alpha.example/study)][[2](https://beta.example/paper)].",
             result["markdown"],
         )
         self.assertIn(
-            "Linked group [1](https://alpha.example/study)[2](https://beta.example/paper).",
+            r"Linked group [[1](https://alpha.example/study)][[2](https://beta.example/paper)].",
             result["markdown"],
         )
 
@@ -438,7 +491,7 @@ class ContentExportTest(unittest.TestCase):
         self.assertEqual(self.page.evaluate("window.__carouselOpacityWhenAdvanced"), "0")
         self.assertNotIn("link.springer.com", result["markdown"])
         self.assertIn(
-            "Carousel evidence [1](https://alpha.example/carousel)[2](https://beta.example/carousel).",
+            r"Carousel evidence [[1](https://alpha.example/carousel)][[2](https://beta.example/carousel)].",
             result["markdown"],
         )
 
@@ -504,9 +557,9 @@ class ContentExportTest(unittest.TestCase):
         self.assertNotIn("link.springer.com", result["markdown"])
         self.assertIn(
             "Grouped evidence "
-            "[1](https://alpha.example/one)"
-            "[2](https://alpha.example/fifteen)"
-            "[3](https://alpha.example/eighteen).",
+            r"[[1](https://alpha.example/one)]"
+            r"[[2](https://alpha.example/fifteen)]"
+            r"[[3](https://alpha.example/eighteen)].",
             result["markdown"],
         )
 
@@ -592,17 +645,17 @@ class ContentExportTest(unittest.TestCase):
         markdown = response["result"]["markdown"]
         self.assertIn(
             "Multiple sources "
-            "[1](https://arxiv.org/abs/2104.10792)"
-            "[2](https://acs.figshare.com/collections/Rational_Solvent_Selection_for_Pharmaceutical_Impurity_Purge/3984081).",
+            r"[[1](https://arxiv.org/abs/2104.10792)]"
+            r"[[2](https://acs.figshare.com/collections/Rational_Solvent_Selection_for_Pharmaceutical_Impurity_Purge/3984081)].",
             markdown,
         )
         self.assertIn(
             "Single source "
-            "[3](https://www.researchgate.net/publication/12345_A_single-source_solubility_study).",
+            r"[[3](https://www.researchgate.net/publication/12345_A_single-source_solubility_study)].",
             markdown,
         )
         self.assertNotIn(
-            "Single source [3](https://www.researchgate.net/publication/12345_A_single-source_solubility_study)[",
+            r"Single source [[3](https://www.researchgate.net/publication/12345_A_single-source_solubility_study)][",
             markdown,
         )
         self.assertLess(elapsed_ms, 4000)
@@ -637,8 +690,8 @@ class ContentExportTest(unittest.TestCase):
 
         self.assertTrue(response["ok"])
         markdown = response["result"]["markdown"]
-        self.assertIn("First result [1](https://alpha.example/table)", markdown)
-        self.assertIn("Second result [2](https://beta.example/table)", markdown)
+        self.assertIn(r"First result [[1](https://alpha.example/table)]", markdown)
+        self.assertIn(r"Second result [[2](https://beta.example/table)]", markdown)
 
     def test_renumbers_distinct_urls_that_chatgpt_labels_as_one(self):
         body = f"""
@@ -658,7 +711,7 @@ class ContentExportTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         result = response["result"]
         self.assertIn(
-            "Sources [1](https://alpha.example/repeated)[2](https://beta.example/repeated).",
+            r"Sources [[1](https://alpha.example/repeated)][[2](https://beta.example/repeated)].",
             result["markdown"],
         )
 
@@ -722,12 +775,14 @@ class ContentExportTest(unittest.TestCase):
             window.chrome = {{
               tabs: {{
                 query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
-                sendMessage: async (_tabId, message, options) => {{
-                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') {{
-                    window.__sourceOpenFrames.push(options?.frameId ?? 0);
-                    return {{ ok: true, openedSources: options?.frameId === 7 }};
-                  }}
-                  window.__exportFrames.push(options?.frameId ?? 0);
+              sendMessage: async (_tabId, message, options) => {{
+                if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') {{
+                  window.__sourceOpenFrames.push(options?.frameId ?? 0);
+                  return {{ ok: true, openedSources: options?.frameId === 7 }};
+                }}
+                if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') return {{ ok: false }};
+                if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') return {{ ok: true, heading: '' }};
+                window.__exportFrames.push(options?.frameId ?? 0);
                   if (options?.frameId !== 7) return {{ ok: false, error: 'Wrong frame' }};
                   return {{
                     ok: true,
@@ -796,10 +851,165 @@ x^2 + y^2
         )
         self.assertEqual(fenced["replacementCount"], 0)
         self.assertEqual(fenced["markdown"], "```text\n[ \\not_math ]\n```")
+        # 整行只有引用链接（URL 含下划线等公式特征）不能被误判成裸公式。
+        citation_line = self.page.evaluate(
+            "value => fixLatexDisplayDelimiters(value)",
+            "[[1](https://example.com/my_paper_2024)]",
+        )
+        self.assertEqual(citation_line["replacementCount"], 0)
+        self.assertEqual(citation_line["markdown"], "[[1](https://example.com/my_paper_2024)]")
         self.assertEqual(
             self.page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth"),
             True,
         )
+
+    def test_download_uses_named_anchor_with_report_title_filename(self):
+        self.page.add_init_script(
+            f"""
+            window.__anchorDownloadArgs = null;
+            window.chrome = {{
+              tabs: {{
+                query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)}, title: '6aa6e282-9290-83e9-a810-87cd1ae29cc1' }}],
+                sendMessage: async (_tabId, message) => {{
+                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
+                  return {{
+                    ok: true,
+                    result: {{
+                      title: 'gpt-电子围栏技术调研报告',
+                      filename: 'gpt-电子围栏技术调研报告',
+                      markdown: '# gpt-电子围栏技术调研报告\\n\\nSee [source](https://example.com).',
+                      sourceCount: 1,
+                      citationCount: 1,
+                      warnings: [],
+                    }},
+                  }};
+                }},
+              }},
+              webNavigation: {{
+                getAllFrames: async () => [{{ frameId: 0, parentFrameId: -1, url: {json.dumps(TARGET_URL)} }}],
+              }},
+            }};
+            """
+        )
+        self.page.goto((ROOT / "popup.html").as_uri(), wait_until="domcontentloaded")
+        # Chrome 忽略 chrome.downloads.download 的 filename 参数，生产代码改用
+        # anchor download 属性命名；测试拦截该函数并断言 data URL 与文件名。
+        self.page.evaluate(
+            """() => {
+                window.triggerNamedDownload = (url, filename) => {
+                    window.__anchorDownloadArgs = { url, filename };
+                };
+            }"""
+        )
+
+        self.page.locator("#startButton").click()
+        self.page.wait_for_function("!document.querySelector('#downloadButton').disabled")
+        self.page.locator("#downloadButton").click()
+        self.page.wait_for_function("window.__anchorDownloadArgs !== null")
+
+        args = self.page.evaluate("window.__anchorDownloadArgs")
+        self.assertTrue(args["url"].startswith("data:text/markdown;charset=utf-8;base64,"))
+        # 标签页标题是会话 UUID 时不采用；文件名使用插件识别出的报告标题。
+        self.assertRegex(args["filename"], r"^gpt-电子围栏技术调研报告_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}\.md$")
+        # data URL 内容可解码回报告正文。
+        import base64
+        decoded = base64.b64decode(args["url"].split(",", 1)[1]).decode("utf-8")
+        self.assertIn("# gpt-电子围栏技术调研报告", decoded)
+        self.assertIn("download started", self.page.locator("#status").inner_text().lower())
+
+    def test_structured_payload_export_preserves_latex_delimiters(self):
+        marker = "\ue200cite1\ue201"
+        report_md = (
+            "# 电子围栏结构化报告\n\n"
+            f"正文引用 {marker} 出现。\n\n"
+            "行间公式 \\[ E = mc^2 \\] 与行内 \\frac{a}{b} 保留。"
+        )
+        # 与真实页面一致的两层编码：会话 JSON 作为字符串嵌在内层，引用走 content_references。
+        inner = {
+            "record": {
+                "report_message": {
+                    "content": {"parts": [report_md]},
+                    "status": "DONE",
+                },
+                "content_references": [
+                    {"matched_text": marker, "prefix": "", "safe_urls": ["https://example.com/structured-source"]}
+                ],
+            }
+        }
+        payload_json = json.dumps({"wrapper": json.dumps(inner, ensure_ascii=False)}, ensure_ascii=False)
+        script = f"streamController.enqueue({json.dumps(payload_json, ensure_ascii=False)});"
+        body = f"<!doctype html><html><body><script>{script}</script></body></html>"
+
+        response = export_fixture(self.page, body, "https://chatgpt.com/share/s-structured-1")
+
+        self.assertTrue(response["ok"])
+        result = response["result"]
+        self.assertEqual(result["title"], "gpt-电子围栏结构化报告")
+        self.assertIn("\\[ E = mc^2 \\]", result["markdown"])
+        self.assertIn("\\frac{a}{b}", result["markdown"])
+        self.assertIn(r"[[1](https://example.com/structured-source)]", result["markdown"])
+        self.assertEqual(result["citationCount"], 1)
+        # 快路径同样在末尾追加参考文献列表（中文报告用中文标题）；
+        # payload 没有来源标题时用 URL 派生的可读标题（host · 路径词）
+        self.assertIn("## 参考文献", result["markdown"])
+        self.assertIn(
+            r"- [[1](https://example.com/structured-source)] example.com · structured source",
+            result["markdown"],
+        )
+
+    def test_fast_path_prefers_matching_structured_payload(self):
+        self.page.add_init_script(
+            f"""
+            window.__exportFrames = [];
+            window.__headingFrames = [];
+            window.__structuredProbes = [];
+            window.chrome = {{
+              tabs: {{
+                query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
+                sendMessage: async (_tabId, message, options) => {{
+                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
+                  if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') {{
+                    window.__structuredProbes.push(options?.frameId ?? 0);
+                    return {{
+                      ok: true,
+                      result: {{
+                        title: 'gpt-电子围栏结构化报告',
+                        filename: 'gpt-电子围栏结构化报告',
+                        markdown: '# gpt-电子围栏结构化报告\\n\\n快路径正文 [[1](https://example.com/source)]。行间 \\\\[ E = mc^2 \\\\]。',
+                        sourceCount: 1,
+                        citationCount: 1,
+                        warnings: [],
+                      }},
+                    }};
+                  }}
+                  if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
+                    window.__headingFrames.push(options?.frameId ?? 0);
+                    return {{ ok: true, heading: options?.frameId === 7 ? '电子围栏结构化报告' : '' }};
+                  }}
+                  window.__exportFrames.push(options?.frameId ?? 0);
+                  return {{ ok: false, error: 'slow path should not run' }};
+                }},
+              }},
+              webNavigation: {{
+                getAllFrames: async () => [
+                  {{ frameId: 0, parentFrameId: -1, url: {json.dumps(TARGET_URL)} }},
+                  {{ frameId: 7, parentFrameId: 0, url: 'https://connector-openai-deep-research.web-sandbox.oaiusercontent.com/' }},
+                ],
+              }},
+            }};
+            """
+        )
+        self.page.goto((ROOT / "popup.html").as_uri(), wait_until="domcontentloaded")
+
+        self.page.locator("#startButton").click()
+        self.page.wait_for_function("!document.querySelector('#downloadButton').disabled")
+
+        # 快路径命中：payload 探测 + 报告 frame 标题比对成功，完全不需要逐 frame 导出。
+        self.assertEqual(self.page.evaluate("window.__structuredProbes"), [0])
+        self.assertEqual(self.page.evaluate("window.__headingFrames"), [7])
+        self.assertEqual(self.page.evaluate("window.__exportFrames"), [])
+        self.assertIn("Page detected", self.page.locator("#status").inner_text())
+        self.assertIn("电子围栏结构化报告", self.page.locator("#summary").inner_text())
 
     def test_manifest_injects_into_deep_research_frames(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())
