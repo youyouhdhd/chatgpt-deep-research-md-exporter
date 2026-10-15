@@ -4,6 +4,17 @@
 
 用于从具体 ChatGPT 对话中直接导出已打开的 **Deep Research 全屏报告**，生成 **Markdown (.md)** 并将内部引用解析为可点击链接。
 
+## 本 Fork 的更新
+
+本 fork（v0.2.14）基于原版插件（[qpwm06/chatgpt-deep-research-md-exporter](https://github.com/qpwm06/chatgpt-deep-research-md-exporter)，v0.2.5）增强，主要区别：
+
+- **可用的下载与正确文件名** — 下载文件以插件识别出的报告标题 + 本地时间命名，如 `gpt-电子围栏技术调研报告_2026-10-15_11-02.md`；Chrome 会忽略 `chrome.downloads.download` 的 `filename` 参数（导致文件名变成 blob UUID 乱码），因此改用 anchor `download` 属性 + 自包含 data URL 实现可靠命名
+- **全屏报告识别修复** — 内容脚本注入扩展到跨域报告 iframe（`*.web-sandbox.oaiusercontent.com`），解决"没有识别到当前全屏报告"的识别失败
+- **秒级结构化快速路径** — 优先从页面内嵌数据流重建报告，保留原始 LaTeX 定界符与完整引用映射；逐个展开 citation 轮播的 DOM 慢速方式仅作回退
+- **引用渲染与编号** — 引用输出为 `[[N](url)]`，渲染为 `[1][2][3]`，不会触发数学渲染器的行间公式误判或 Obsidian wikilink；ChatGPT 会话级稀疏编号（如 50 跳到 103）会重排为连续序列
+- **文末参考文献列表** — 自动追加编号与正文引用一一对应、可点击的参考文献列表，并显示来源标题（有真实标题用真实标题，否则用 URL 派生的 `域名 · 路径词`）
+- **回归测试** — 19 项 Playwright 端到端测试与真实浏览器下载探针（`tests/`）
+
 便于搜索的名称：
 
 - ChatGPT Deep Research Markdown Exporter
