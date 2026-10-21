@@ -43,6 +43,38 @@ async function sendExportMessage(tab) {
 
   const attempts = [];
   const structuredAttempts = [];
+
+  // 多报告诊断：每个 frame 的报告标题与可见性 + 顶层内嵌数据流里的全部报告标题。
+  // 这些只做只读探测，不点击任何页面控件。
+  const frameHeadings = [];
+  for (const frame of orderedFrames) {
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: 'DEEP_RESEARCH_REPORT_HEADING',
+      }, { frameId: frame.frameId });
+      frameHeadings.push({
+        frameId: frame.frameId,
+        frameUrl: frame.url,
+        heading: response?.heading || '',
+        visible: response?.visible === undefined ? null : Boolean(response?.visible),
+        error: null,
+      });
+    } catch (error) {
+      frameHeadings.push({
+        frameId: frame.frameId, frameUrl: frame.url, heading: '', visible: null, error: String(error),
+      });
+    }
+  }
+  let structuredTitles = [];
+  try {
+    const response = await chrome.tabs.sendMessage(tab.id, {
+      type: 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES',
+    }, { frameId: 0 });
+    structuredTitles = Array.isArray(response?.items) ? response.items : [];
+  } catch (error) {
+    structuredTitles = [{ error: String(error) }];
+  }
+  const multiReport = { frameHeadings, structuredTitles };
   for (const frame of orderedFrames) {
     try {
       const response = await chrome.tabs.sendMessage(tab.id, {
@@ -60,6 +92,26 @@ async function sendExportMessage(tab) {
     } catch (error) {
       structuredAttempts.push({ frameId: frame.frameId, frameUrl: frame.url, ok: false, error: String(error) });
     }
+  }
+
+  if (params.get('probeOnly') === '1') {
+    // 只读探测：不点击任何页面控件、不触发 DOM 导出，专用于多报告问题定位。
+    return {
+      response: {
+        result: {
+          title: 'Multi-report probe',
+          markdown: '',
+          sourceCount: 0,
+          citationCount: 0,
+          warnings: [],
+          diagnostics: { multiReport },
+        },
+      },
+      frame: null,
+      attempts,
+      structuredAttempts,
+      multiReport,
+    };
   }
 
   if (params.get('structuredOnly') === '1') {
@@ -246,6 +298,7 @@ async function runDiagnostic() {
     frame: diagnostic.frame,
     attempts: diagnostic.attempts,
     structuredAttempts: diagnostic.structuredAttempts,
+    multiReport: diagnostic.multiReport,
     result: diagnostic.response.result,
   }, null, 2);
   // Chrome 忽略 chrome.downloads.download 的 filename 参数，改用 anchor download 属性命名。

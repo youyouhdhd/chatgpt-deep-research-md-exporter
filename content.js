@@ -2274,6 +2274,17 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       sendResponse({ ok: Boolean(result), result });
       return undefined;
     }
+    if (message?.type === 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES') {
+      // 诊断用：列出当前页面内嵌数据流里所有报告 payload 的标题与正文长度。
+      const items = extractTransportPayloadsFromScripts()
+        .filter((payload) => payload.includes('report_message') && payload.includes('content_references'))
+        .map((payload) => {
+          const body = extractEmbeddedReportBody(payload);
+          return { title: firstHeadingFromMarkdown(body) || '', bodyLength: body.length };
+        });
+      sendResponse({ ok: true, items });
+      return undefined;
+    }
     if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') {
       sendResponse({ ok: true, openedSources: maybeOpenSourcesPanels() });
       return undefined;
