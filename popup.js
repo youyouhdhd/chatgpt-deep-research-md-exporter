@@ -344,6 +344,9 @@ async function collectReportFrameHeadings(tab, orderedFrameIds) {
           frameId,
           heading: String(response.heading || ''),
           visible: response.visible !== false,
+          viewport: Array.isArray(response?.viewport) && response.viewport.length >= 2
+            ? [Number(response.viewport[0]) || 0, Number(response.viewport[1]) || 0]
+            : null,
         });
       }
     } catch (error) {
@@ -356,14 +359,21 @@ async function collectReportFrameHeadings(tab, orderedFrameIds) {
   return { entries, frame0Unreachable };
 }
 
+function headingEntryArea(entry) {
+  if (!entry?.viewport || entry.viewport.length < 2) return 0;
+  return Math.max(entry.viewport[0] * entry.viewport[1], 0);
+}
+
 function pickOpenHeadingEntry(headingEntries) {
-  // 顶层页面的标题来自全屏层（新架构下同源 about:blank 报告 iframe 需显式跨进
-  // contentDocument 读取，见 content.js），指向当前打开的那一份，最可靠；
-  // 否则退回第一个"可见"报告 frame（about:blank iframe 可能全部报可见，仅作兜底）。
-  return headingEntries.find((entry) => entry.frameId === 0)
-    || headingEntries.find((entry) => entry.visible)
-    || headingEntries[0]
-    || null;
+  // 顶层页面的标题来自全屏层，指向当前打开的那一份，最可靠；否则取视口面积最大的
+  // 报告 frame——全屏打开的报告 iframe 覆盖整个视口，内联预览卡片明显更小
+  // （about:blank/srcdoc iframe 都会报告自身真实尺寸）。
+  const topLevel = headingEntries.find((entry) => entry.frameId === 0);
+  if (topLevel) return topLevel;
+  return headingEntries.reduce(
+    (best, entry) => (headingEntryArea(entry) > headingEntryArea(best) ? entry : best),
+    headingEntries[0],
+  ) || null;
 }
 
 async function tryStructuredFastPath(tab, message, openEntry, trace) {

@@ -1455,6 +1455,87 @@ x^2 + y^2
         # 全屏层标题指向 253（第三份）：只有它应被导出
         self.assertEqual(self.page.evaluate("window.__exportFrames"), [253])
 
+    def test_heading_reads_srcdoc_of_fullscreen_sandbox_iframe(self):
+        # 新架构：报告在 sandbox srcdoc iframe 里，父页面读不到 contentDocument，
+        # 但 srcdoc 属性可读、iframe 元素几何尺寸可测——覆盖视口的就是打开的报告。
+        body = """
+        <!doctype html><html><body>
+          <main></main>
+          <iframe srcdoc="<article><h1>第一份报告</h1><p>内容</p></article>"
+                  style="width:300px;height:200px"></iframe>
+          <iframe srcdoc="<article><h1>第二份报告</h1><p>内容</p></article>"
+                  sandbox="allow-scripts" style="position:fixed;inset:0;width:100vw;height:100vh"></iframe>
+          <iframe srcdoc="<article><h1>第三份报告</h1><p>内容</p></article>"
+                  style="width:300px;height:200px"></iframe>
+        </body></html>
+        """
+        self.page.route(
+            "**/*",
+            lambda route: route.fulfill(
+                status=200, content_type="text/html; charset=utf-8", body=body
+            ),
+        )
+        self.page.add_init_script(
+            """
+            window.chrome = {
+              runtime: {
+                onMessage: { addListener(listener) { window.__exportListener = listener; } }
+              }
+            };
+            """
+        )
+        self.page.goto(TARGET_URL, wait_until="domcontentloaded")
+        self.page.add_script_tag(path=str(CONTENT_SCRIPT))
+
+        response = self.page.evaluate(
+            """() => new Promise((resolve) => {
+                window.__exportListener({ type: 'DEEP_RESEARCH_REPORT_HEADING' }, null, resolve);
+            })"""
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["heading"], "第二份报告")
+        self.assertEqual(len(response["viewport"]), 2)
+
+    def test_open_report_picked_by_largest_frame_viewport(self):
+        # 全部报告 frame 都"可见"时，视口面积最大的（全屏打开的那份）胜出。
+        self.page.add_init_script(
+            f"""
+            window.__exportFrames = [];
+            window.chrome = {{
+              tabs: {{
+                query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
+                sendMessage: async (_tabId, message, options) => {{
+                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
+                  if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') return {{ ok: false }};
+                  if (message?.type === 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES') return {{ ok: true, items: [] }};
+                  if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
+                    if (options?.frameId === 252) return {{ ok: true, heading: '内联预览报告', visible: true, viewport: [800, 600] }};
+                    if (options?.frameId === 253) return {{ ok: true, heading: '全屏打开的报告', visible: true, viewport: [1920, 1080] }};
+                    return {{ ok: true, heading: '' }};
+                  }}
+                  window.__exportFrames.push(options?.frameId ?? 0);
+                  return {{ ok: true, result: {{ title: 'gpt-' + options?.frameId, filename: 'x', markdown: '# ok', sourceCount: 1, citationCount: 1, warnings: [] }} }};
+                }},
+              }},
+              webNavigation: {{
+                getAllFrames: async () => [
+                  {{ frameId: 0, parentFrameId: -1, url: {json.dumps(TARGET_URL)} }},
+                  {{ frameId: 252, parentFrameId: 0, url: 'about:blank' }},
+                  {{ frameId: 253, parentFrameId: 0, url: 'about:blank' }},
+                ],
+              }},
+            }};
+            """
+        )
+        self.page.goto((ROOT / "popup.html").as_uri(), wait_until="domcontentloaded")
+
+        self.page.locator("#startButton").click()
+        self.page.wait_for_function("!document.querySelector('#downloadButton').disabled")
+
+        # 视口面积最大的 253（全屏打开的报告）应被导出，252 不被触碰
+        self.assertEqual(self.page.evaluate("window.__exportFrames"), [253])
+
     def test_manifest_injects_into_deep_research_frames(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())
         content_script = manifest["content_scripts"][0]

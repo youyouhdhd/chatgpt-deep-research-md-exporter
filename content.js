@@ -472,6 +472,32 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     return TOC_HEADING_RE.test(normalizeText(text));
   }
 
+  function findFullscreenSrcdocHeading() {
+    // 新架构：全屏报告渲染在 sandbox iframe 里（无 allow-same-origin，父页面读不到
+    // contentDocument），但报告全文写在 srcdoc 属性中，且 iframe 元素本身的几何
+    // 尺寸在父页面可测——覆盖视口的 srcdoc iframe 就是当前打开的那份报告。
+    const viewportArea = Math.max(window.innerWidth * window.innerHeight, 1);
+    let bestTitle = '';
+    let bestCoverage = 0;
+    for (const iframe of Array.from(document.querySelectorAll('iframe[srcdoc]'))) {
+      try {
+        if (!isVisible(iframe)) continue;
+        const rect = iframe.getBoundingClientRect();
+        const coverage = (rect.width * rect.height) / viewportArea;
+        if (coverage < 0.35) continue;
+        const match = (iframe.getAttribute('srcdoc') || '').match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+        if (!match) continue;
+        const title = normalizeText(match[1].replace(/<[^>]+>/g, ' '));
+        if (!title) continue;
+        if (coverage > bestCoverage) {
+          bestTitle = title;
+          bestCoverage = coverage;
+        }
+      } catch {}
+    }
+    return bestTitle;
+  }
+
   function findFullscreenIframeHeading() {
     // 新架构：全屏报告渲染在同源 about:blank iframe 里，querySelector 不会跨文档边界，
     // 必须显式进入 iframe 的 contentDocument 才能读到当前打开报告的标题。
@@ -2320,12 +2346,14 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       let heading = root ? (findTitleElement(root) || root.querySelector('h1')) : null;
       let headingText = normalizeText(heading?.textContent || '');
       if (!headingText && isDirectConversationPage()) {
-        headingText = findFullscreenIframeHeading();
+        headingText = findFullscreenSrcdocHeading() || findFullscreenIframeHeading();
       }
       sendResponse({
         ok: true,
         heading: headingText,
         visible: !document.hidden && window.innerWidth > 0 && window.innerHeight > 0,
+        // iframe 自身的视口尺寸反映它实际占的大小：全屏打开的报告 frame 显著大于内联预览。
+        viewport: [window.innerWidth, window.innerHeight],
       });
       return undefined;
     }
