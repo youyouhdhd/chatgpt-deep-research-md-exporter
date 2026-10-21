@@ -781,6 +781,7 @@ class ContentExportTest(unittest.TestCase):
                   return {{ ok: true, openedSources: options?.frameId === 7 }};
                 }}
                 if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') return {{ ok: false }};
+                  if (message?.type === 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES') return {{ ok: true, items: [] }};
                 if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') return {{ ok: true, heading: '' }};
                 window.__exportFrames.push(options?.frameId ?? 0);
                   if (options?.frameId !== 7) return {{ ok: false, error: 'Wrong frame' }};
@@ -1172,6 +1173,7 @@ x^2 + y^2
                     window.__structuredProbes.push(options?.frameId ?? 0);
                     return {{ ok: false }};
                   }}
+                  if (message?.type === 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES') return {{ ok: true, items: [] }};
                   if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
                     return {{
                       ok: true,
@@ -1291,6 +1293,7 @@ x^2 + y^2
                 sendMessage: async (_tabId, message, options) => {{
                   if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
                   if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') return {{ ok: false }};
+                  if (message?.type === 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES') return {{ ok: true, items: [] }};
                   if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
                     window.__headingFrames.push(options?.frameId ?? 0);
                     if (options?.frameId === 178) return {{ ok: true, heading: '当前打开的报告', visible: true }};
@@ -1319,6 +1322,56 @@ x^2 + y^2
         # 可见的 178 优先命中并立即返回，隐藏的 181 不应被触碰。
         self.assertEqual(self.page.evaluate("window.__exportFrames"), [178])
         self.assertIn("Page detected", self.page.locator("#status").inner_text())
+
+    def test_debug_log_captures_failed_export_trace(self):
+        # 识别失败时，弹窗内置调试日志应记录完整链路（frame 清单、标题探测、失败原因）。
+        self.page.add_init_script(
+            f"""
+            window.chrome = {{
+              tabs: {{
+                query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
+                sendMessage: async (_tabId, message, options) => {{
+                  if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
+                    if ((options?.frameId ?? 0) === 7) {{
+                      return {{ ok: true, heading: '当前打开的报告', visible: true }};
+                    }}
+                    throw new Error('Could not establish connection. Receiving end does not exist.');
+                  }}
+                  if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') return {{ ok: false }};
+                  if (message?.type === 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES') return {{ ok: true, items: [] }};
+                  if (message?.type === 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES') {{
+                    return {{ ok: true, items: [{{ title: '第一份报告', bodyLength: 100 }}, {{ title: '当前打开的报告', bodyLength: 200 }}] }};
+                  }}
+                  if ((options?.frameId ?? 0) === 7) {{
+                    return {{ ok: true, result: {{ title: 'gpt-当前打开的报告', filename: 'x', markdown: '# ok', sourceCount: 1, citationCount: 1, warnings: [] }} }};
+                  }}
+                  return {{ ok: false, error: 'no report here' }};
+                }},
+              }},
+              webNavigation: {{
+                getAllFrames: async () => [
+                  {{ frameId: 0, parentFrameId: -1, url: {json.dumps(TARGET_URL)} }},
+                  {{ frameId: 7, parentFrameId: 0, url: 'about:blank' }},
+                ],
+              }},
+            }};
+            """
+        )
+        self.page.goto((ROOT / "popup.html").as_uri(), wait_until="domcontentloaded")
+
+        self.page.locator("#startButton").click()
+        self.page.wait_for_function("!document.querySelector('#startButton').disabled")
+
+        debug = self.page.evaluate("window.__lastDebugLog")
+        self.assertIsNotNone(debug)
+        self.assertEqual(debug["outcome"], "ok")
+        steps = [entry["step"] for entry in debug["trace"]]
+        self.assertIn("frames", steps)
+        self.assertIn("headings", steps)
+        self.assertIn("fast-reject", steps)
+        self.assertIn("structured-titles", steps)
+        # 调试按钮在有一次识别记录后可用
+        self.assertFalse(self.page.locator("#debugButton").is_disabled())
 
     def test_manifest_injects_into_deep_research_frames(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())

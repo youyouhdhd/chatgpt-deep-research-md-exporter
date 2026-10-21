@@ -5,6 +5,7 @@ const startButton = document.getElementById('startButton');
 const latexFixButton = document.getElementById('latexFixButton');
 const downloadButton = document.getElementById('downloadButton');
 const copyButton = document.getElementById('copyButton');
+const debugButton = document.getElementById('debugButton');
 const titlePrefixInput = document.getElementById('titlePrefixInput');
 const exportModeSelect = document.getElementById('exportModeSelect');
 const localeEnButton = document.getElementById('localeEnButton');
@@ -46,6 +47,8 @@ const MESSAGES = {
     latex_fix_button: 'Fix LaTeX $',
     download_button: 'Download Markdown',
     copy_button: 'Copy Markdown',
+    debug_button: 'Copy Debug Info',
+    status_debug_copied: 'Debug info copied to clipboard. Send it to the maintainer.',
     tips_title: 'How To Use',
     tip1: 'Open a specific ChatGPT conversation, then open its Deep Research report full screen.',
     tip2: 'If source URLs are incomplete, expand the page’s Sources panel before exporting.',
@@ -83,6 +86,8 @@ const MESSAGES = {
     latex_fix_button: 'LaTeX $ 修正',
     download_button: '下载 Markdown',
     copy_button: '复制 Markdown',
+    debug_button: '复制调试信息',
+    status_debug_copied: '调试信息已复制到剪贴板，请发给维护者分析。',
     tips_title: '使用说明',
     tip1: '进入具体 ChatGPT 对话，并先把其中的 Deep Research 报告全屏打开。',
     tip2: '如果来源 URL 提取不全，先把页面中的 Sources 区域展开后再导出。',
@@ -149,6 +154,7 @@ function applyLocale() {
   latexFixButton.textContent = t('latex_fix_button');
   downloadButton.textContent = t('download_button');
   copyButton.textContent = t('copy_button');
+  debugButton.textContent = t('debug_button');
   tipsTitleNode.textContent = t('tips_title');
   tip1Node.textContent = t('tip1');
   tip2Node.textContent = t('tip2');
@@ -212,6 +218,7 @@ function setBusy(isBusy) {
   latexFixButton.disabled = isBusy || !cachedExport || countLatexDisplayDelimiters(cachedExport.markdown) === 0;
   downloadButton.disabled = isBusy || !cachedExport;
   copyButton.disabled = isBusy || !cachedExport;
+  debugButton.disabled = isBusy || !lastDebugLog;
 }
 
 function setStatus(message) {
@@ -349,14 +356,17 @@ async function collectReportFrameHeadings(tab, orderedFrameIds) {
   return { entries, frame0Unreachable };
 }
 
-async function tryStructuredFastPath(tab, message, headingEntries) {
+async function tryStructuredFastPath(tab, message, headingEntries, trace) {
   // 同一会话可能包含多份深度调研：内嵌数据流里第一份不一定是当前打开的那份。
   // 顶层页面的标题来自全屏层（新架构下 about:blank 报告 iframe 与主页面同源，
   // 可直接读到当前打开的那份），最可靠；否则退回"可见"报告 frame 的标题。
   const open = headingEntries.find((entry) => entry.frameId === 0)
     || headingEntries.find((entry) => entry.visible)
     || headingEntries[0];
-  if (!open) return null;
+  if (!open) {
+    trace.push({ step: 'fast-reject', reason: 'no-open-heading' });
+    return null;
+  }
 
   let structured = null;
   try {
@@ -366,25 +376,93 @@ async function tryStructuredFastPath(tab, message, headingEntries) {
       sourceUrl: message?.sourceUrl,
       matchTitle: open.heading,
     }, { frameId: 0 });
-  } catch {
+  } catch (error) {
+    trace.push({ step: 'fast-reject', reason: 'probe-error', matchTitle: open.heading, error: String(error?.message || error) });
     return null;
   }
-  if (!structured?.ok || !structured?.result?.markdown) return null;
+  if (!structured?.ok || !structured?.result?.markdown) {
+    trace.push({ step: 'fast-reject', reason: structured?.ok ? 'no-markdown' : 'no-structured-result', matchTitle: open.heading, error: structured?.error || '' });
+    return null;
+  }
 
   // citation 映射未命中时 payload 数据不完整，交给 DOM 路径兜底。
   const citationCount = Number(structured.result.citationCount) || 0;
-  if (citationCount === 0) return null;
+  if (citationCount === 0) {
+    trace.push({ step: 'fast-reject', reason: 'zero-citations', matchTitle: open.heading, structuredTitle: structured.result.title });
+    return null;
+  }
 
   const prefix = String(message?.titlePrefix || '').trim();
   const rawTitle = String(structured.result.title || '');
   const candidate = prefix && rawTitle.startsWith(prefix) ? rawTitle.slice(prefix.length) : rawTitle;
-  if (!normalizedCompareText(candidate)) return null;
+  if (!normalizedCompareText(candidate)) {
+    trace.push({ step: 'fast-reject', reason: 'empty-candidate', structuredTitle: rawTitle });
+    return null;
+  }
   // 双保险：选中的 payload 标题必须仍与打开的报告标题对应。
-  if (!titlesReferToSameReport(candidate, open.heading)) return null;
+  if (!titlesReferToSameReport(candidate, open.heading)) {
+    trace.push({ step: 'fast-reject', reason: 'title-mismatch', matchTitle: open.heading, structuredTitle: candidate });
+    return null;
+  }
+  trace.push({ step: 'fast-accept', matchTitle: open.heading, structuredTitle: candidate });
   return structured;
 }
 
+let lastDebugLog = null;
+
+function finalizeDebugLog(trace, outcome, result) {
+  lastDebugLog = {
+    capturedAt: new Date().toISOString(),
+    mode: currentExportMode(),
+    outcome,
+    resultTitle: result?.result?.title || '',
+    error: result?.error || '',
+    trace,
+  };
+  try { window.__lastDebugLog = lastDebugLog; } catch {}
+  try { chrome.storage?.local?.set({ lastDebugLog }); } catch {}
+}
+
+async function traceStructuredTitles(tab, trace) {
+  // 失败现场取证：把内嵌数据流里的全部报告标题抓进调试日志。
+  try {
+    const response = await chrome.tabs.sendMessage(tab.id, {
+      type: 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES',
+    }, { frameId: 0 });
+    trace.push({ step: 'structured-titles', items: response?.items || [] });
+  } catch (error) {
+    trace.push({ step: 'structured-titles', error: String(error?.message || error) });
+  }
+}
+
+async function tracePostHeadings(tab, orderedFrameIds, trace) {
+  // DOM 导出后再探测一次各 frame 标题/可见性：对比导出前后"当前打开的报告"是否
+  // 被切换，用来定位导出过程本身导致的视图跳转。
+  try {
+    const post = await collectReportFrameHeadings(tab, orderedFrameIds);
+    trace.push({ step: 'post-headings', entries: post.entries });
+  } catch {}
+}
+
 async function sendExportMessage(tab, message) {
+  const trace = [{
+    step: 'start',
+    at: new Date().toISOString(),
+    mode: currentExportMode(),
+    messageType: message?.type,
+    tabUrl: tab?.url || '',
+  }];
+  try {
+    const result = await sendExportMessageInner(tab, message, trace);
+    finalizeDebugLog(trace, result?.ok ? 'ok' : 'error-response', result);
+    return result;
+  } catch (error) {
+    finalizeDebugLog(trace, 'throw', { error: error?.message || String(error) });
+    throw error;
+  }
+}
+
+async function sendExportMessageInner(tab, message, trace) {
   if (!isDirectConversationUrl(tab.url) || !chrome.webNavigation?.getAllFrames) {
     return chrome.tabs.sendMessage(tab.id, message);
   }
@@ -410,6 +488,12 @@ async function sendExportMessage(tab, message) {
 
   if (!orderedFrameIds.includes(0)) orderedFrameIds.push(0);
 
+  trace.push({
+    step: 'frames',
+    frames: frames.map((frame) => ({ frameId: frame.frameId, url: frame.url })),
+    exportFrameOrderHint: orderedFrameIds.slice(),
+  });
+
   // 导出方式：auto（默认）= 快速数据优先、DOM 兜底；fast = 仅快速，未命中直接报错；
   // slow = 跳过快速路径，始终按渲染页面逐个展开 citation（慢但完全跟随当前 DOM）。
   // 快速路径必须先于任何页面点击执行：展开来源面板会真实点击页面控件，多报告会话
@@ -421,14 +505,16 @@ async function sendExportMessage(tab, message) {
     const headingProbe = await collectReportFrameHeadings(tab, orderedFrameIds);
     headingEntries = headingProbe.entries;
     frame0Unreachable = headingProbe.frame0Unreachable;
+    trace.push({ step: 'headings', entries: headingEntries, frame0Unreachable });
     // 扩展刚重载而页面未刷新：顶层内容脚本失联且没有任何 frame 提供报告标题，
     // 任何路径都无法工作，直接给可执行的提示而不是让用户看到一连串连接错误。
     if (frame0Unreachable && headingEntries.length === 0) {
       throw new Error(t('error_stale_page'));
     }
     if (exportMode !== 'slow') {
-      const fastResponse = await tryStructuredFastPath(tab, message, headingEntries);
+      const fastResponse = await tryStructuredFastPath(tab, message, headingEntries, trace);
       if (fastResponse) return fastResponse;
+      await traceStructuredTitles(tab, trace);
       if (exportMode === 'fast') {
         throw new Error(t('error_fast_mode_missed'));
       }
@@ -466,9 +552,20 @@ async function sendExportMessage(tab, message) {
   for (const frameId of exportFrameOrder) {
     try {
       const response = await chrome.tabs.sendMessage(tab.id, message, { frameId });
-      if (response?.ok) return response;
+      trace.push({
+        step: 'export-frame',
+        frameId,
+        ok: Boolean(response?.ok),
+        title: response?.result?.title || '',
+        error: response?.error || '',
+      });
+      if (response?.ok) {
+        await tracePostHeadings(tab, orderedFrameIds, trace);
+        return response;
+      }
       if (response) failedResponses.push(response);
     } catch (error) {
+      trace.push({ step: 'export-frame', frameId, ok: false, error: String(error?.message || error) });
       lastError = error;
     }
   }
@@ -480,8 +577,10 @@ async function sendExportMessage(tab, message) {
       const messageText = String(response?.error || '').trim();
       if (messageText && !errors.includes(messageText)) errors.push(messageText);
     }
+    await tracePostHeadings(tab, orderedFrameIds, trace);
     return { ok: false, error: errors.join('｜') || null };
   }
+  await tracePostHeadings(tab, orderedFrameIds, trace);
   throw lastError || new Error(t('generic_export_failed'));
 }
 
@@ -673,6 +772,15 @@ startButton.addEventListener('click', inspectCurrentTab);
 latexFixButton.addEventListener('click', fixCachedLatex);
 downloadButton.addEventListener('click', downloadMarkdown);
 copyButton.addEventListener('click', copyMarkdown);
+debugButton.addEventListener('click', async () => {
+  if (!lastDebugLog) return;
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(lastDebugLog, null, 2));
+    setStatus(t('status_debug_copied'));
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error || t('generic_copy_failed')));
+  }
+});
 localeEnButton.addEventListener('click', async () => {
   await saveLocale('en');
 });
@@ -704,6 +812,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadLocale();
   await loadPrefix();
   loadExportMode();
+  // 恢复上次识别的调试日志（弹窗关闭后仍可复制）。
+  try {
+    const stored = await chrome.storage?.local?.get?.({ lastDebugLog: null });
+    if (stored?.lastDebugLog) lastDebugLog = stored.lastDebugLog;
+  } catch {}
   setStatus(t('status_idle'));
   setBusy(false);
 });
