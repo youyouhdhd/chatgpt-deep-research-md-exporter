@@ -58,6 +58,7 @@ const MESSAGES = {
     error_tab: 'No readable active tab was found.',
     error_page: 'Please open a Deep Research report in a ChatGPT conversation first.',
     error_fast_mode_missed: 'Fast mode found no embedded data matching the open report. Try Auto or DOM-only mode.',
+    error_stale_page: 'This page was opened before the extension reloaded. Refresh the ChatGPT tab (F5) and try again.',
     generic_export_failed: 'Export failed.',
     generic_download_failed: 'Download failed.',
     generic_copy_failed: 'Copy failed.',
@@ -94,6 +95,7 @@ const MESSAGES = {
     error_tab: '没有可用的当前标签页。',
     error_page: '请先进入具体 ChatGPT 对话并打开 Deep Research 全屏报告。',
     error_fast_mode_missed: '快速模式没有匹配到当前打开报告的内嵌数据。可改用“自动”或“仅 DOM”模式重试。',
+    error_stale_page: '页面在扩展重载前就已打开，内容脚本已失联。请刷新 ChatGPT 页面（F5）后重试。',
     generic_export_failed: '导出失败。',
     generic_download_failed: '下载失败。',
     generic_copy_failed: '复制失败。',
@@ -324,6 +326,7 @@ function titlesReferToSameReport(candidate, heading) {
 
 async function collectReportFrameHeadings(tab, orderedFrameIds) {
   const entries = [];
+  let frame0Unreachable = false;
   for (const frameId of orderedFrameIds) {
     try {
       const response = await chrome.tabs.sendMessage(tab.id, {
@@ -336,15 +339,23 @@ async function collectReportFrameHeadings(tab, orderedFrameIds) {
           visible: response.visible !== false,
         });
       }
-    } catch {}
+    } catch (error) {
+      // 扩展重载后未刷新的页面：旧内容脚本已失联，任何路径都不可能工作。
+      if (frameId === 0 && /receiving end does not exist/i.test(String(error?.message || error))) {
+        frame0Unreachable = true;
+      }
+    }
   }
-  return entries;
+  return { entries, frame0Unreachable };
 }
 
 async function tryStructuredFastPath(tab, message, headingEntries) {
   // 同一会话可能包含多份深度调研：内嵌数据流里第一份不一定是当前打开的那份。
-  // 先取"可见"报告 frame 的标题锁定目标，再让顶层按标题选出对应的 payload。
-  const open = headingEntries.find((entry) => entry.visible) || headingEntries[0];
+  // 顶层页面的标题来自全屏层（新架构下 about:blank 报告 iframe 与主页面同源，
+  // 可直接读到当前打开的那份），最可靠；否则退回"可见"报告 frame 的标题。
+  const open = headingEntries.find((entry) => entry.frameId === 0)
+    || headingEntries.find((entry) => entry.visible)
+    || headingEntries[0];
   if (!open) return null;
 
   let structured = null;
@@ -404,9 +415,17 @@ async function sendExportMessage(tab, message) {
   // 快速路径必须先于任何页面点击执行：展开来源面板会真实点击页面控件，多报告会话
   // 里可能把 ChatGPT 的视图切换到别的报告，导致后续标题收集与导出认错目标。
   let headingEntries = [];
+  let frame0Unreachable = false;
   if (message?.type === 'DEEP_RESEARCH_EXPORT_MARKDOWN') {
     const exportMode = currentExportMode();
-    headingEntries = await collectReportFrameHeadings(tab, orderedFrameIds);
+    const headingProbe = await collectReportFrameHeadings(tab, orderedFrameIds);
+    headingEntries = headingProbe.entries;
+    frame0Unreachable = headingProbe.frame0Unreachable;
+    // 扩展刚重载而页面未刷新：顶层内容脚本失联且没有任何 frame 提供报告标题，
+    // 任何路径都无法工作，直接给可执行的提示而不是让用户看到一连串连接错误。
+    if (frame0Unreachable && headingEntries.length === 0) {
+      throw new Error(t('error_stale_page'));
+    }
     if (exportMode !== 'slow') {
       const fastResponse = await tryStructuredFastPath(tab, message, headingEntries);
       if (fastResponse) return fastResponse;
@@ -432,18 +451,18 @@ async function sendExportMessage(tab, message) {
 
   let lastError = null;
   const failedResponses = [];
-  // Deep Research 正文位于跨域 iframe；逐帧请求可避免顶层错误抢先覆盖正确结果。
-  // 未打开（不可见）的报告 frame 排到最后：隐藏的旧报告 iframe 若先命中会把导出
-  // 指向错误的那一份报告。
-  const hiddenFrameIds = new Set(
-    headingEntries.filter((entry) => !entry.visible).map((entry) => entry.frameId),
-  );
-  const exportFrameOrder = hiddenFrameIds.size > 0
-    ? [
-        ...orderedFrameIds.filter((frameId) => !hiddenFrameIds.has(frameId)),
-        ...orderedFrameIds.filter((frameId) => hiddenFrameIds.has(frameId)),
-      ]
-    : orderedFrameIds;
+  // Deep Research 正文可能位于跨域 iframe，也可能位于 about:blank iframe（新架构，
+  // URL 无法识别）。报告 frame 以"标题探测结果"识别：有标题的可见 frame 最优先，
+  // 隐藏的报告 frame 垫底——隐藏的旧报告 iframe 若先命中会把导出指向错误的报告。
+  const headingFrameIds = new Set(headingEntries.map((entry) => entry.frameId));
+  const visibleHeadingFrameIds = headingEntries.filter((entry) => entry.visible).map((entry) => entry.frameId);
+  const hiddenHeadingFrameIds = headingEntries.filter((entry) => !entry.visible).map((entry) => entry.frameId);
+  const exportFrameOrder = [
+    ...visibleHeadingFrameIds,
+    ...orderedFrameIds.filter((frameId) => !headingFrameIds.has(frameId) && frameId !== 0),
+    0,
+    ...hiddenHeadingFrameIds,
+  ].filter((frameId, index, items) => Number.isInteger(frameId) && items.indexOf(frameId) === index);
   for (const frameId of exportFrameOrder) {
     try {
       const response = await chrome.tabs.sendMessage(tab.id, message, { frameId });

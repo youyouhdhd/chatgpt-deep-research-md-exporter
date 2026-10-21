@@ -1248,6 +1248,78 @@ x^2 + y^2
         self.assertTrue(self.page.evaluate("window.__layerClicked === true"))
         self.assertNotEqual(True, self.page.evaluate("window.__conversationClicked === true"))
 
+    def test_stale_page_prompts_refresh_when_content_script_unreachable(self):
+        # 扩展重载后未刷新的页面：所有内容脚本失联，应提示刷新页面而不是报连接错误。
+        self.page.add_init_script(
+            f"""
+            window.__exportFrames = [];
+            window.chrome = {{
+              tabs: {{
+                query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
+                sendMessage: async (_tabId, message, options) => {{
+                  throw new Error('Could not establish connection. Receiving end does not exist.');
+                }},
+              }},
+              webNavigation: {{
+                getAllFrames: async () => [
+                  {{ frameId: 0, parentFrameId: -1, url: {json.dumps(TARGET_URL)} }},
+                  {{ frameId: 7, parentFrameId: 0, url: 'https://connector-openai-deep-research.web-sandbox.oaiusercontent.com/' }},
+                ],
+              }},
+            }};
+            """
+        )
+        self.page.goto((ROOT / "popup.html").as_uri(), wait_until="domcontentloaded")
+
+        self.page.locator("#startButton").click()
+        self.page.wait_for_function("!document.querySelector('#startButton').disabled")
+
+        status_text = self.page.locator("#status").inner_text()
+        self.assertIn("Refresh the ChatGPT tab", status_text)
+        self.assertTrue(self.page.locator("#downloadButton").is_disabled())
+
+    def test_export_prefers_visible_report_frame_with_about_blank_url(self):
+        # 新架构下报告渲染在 about:blank iframe 里（URL 无法识别）；
+        # 导出顺序必须按标题探测结果：可见报告 frame 优先，隐藏的旧报告垫底。
+        self.page.add_init_script(
+            f"""
+            window.__exportFrames = [];
+            window.__headingFrames = [];
+            window.chrome = {{
+              tabs: {{
+                query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
+                sendMessage: async (_tabId, message, options) => {{
+                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
+                  if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') return {{ ok: false }};
+                  if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
+                    window.__headingFrames.push(options?.frameId ?? 0);
+                    if (options?.frameId === 178) return {{ ok: true, heading: '当前打开的报告', visible: true }};
+                    if (options?.frameId === 181) return {{ ok: true, heading: '旧的隐藏报告', visible: false }};
+                    return {{ ok: true, heading: '' }};
+                  }}
+                  window.__exportFrames.push(options?.frameId ?? 0);
+                  return {{ ok: true, result: {{ title: 'gpt-' + options?.frameId, filename: 'x', markdown: '# ok', sourceCount: 1, citationCount: 1, warnings: [] }} }};
+                }},
+              }},
+              webNavigation: {{
+                getAllFrames: async () => [
+                  {{ frameId: 0, parentFrameId: -1, url: {json.dumps(TARGET_URL)} }},
+                  {{ frameId: 178, parentFrameId: 0, url: 'about:blank' }},
+                  {{ frameId: 181, parentFrameId: 0, url: 'about:blank' }},
+                ],
+              }},
+            }};
+            """
+        )
+        self.page.goto((ROOT / "popup.html").as_uri(), wait_until="domcontentloaded")
+
+        self.page.locator("#startButton").click()
+        self.page.wait_for_function("!document.querySelector('#downloadButton').disabled")
+
+        # 可见的 178 优先命中并立即返回，隐藏的 181 不应被触碰。
+        self.assertEqual(self.page.evaluate("window.__exportFrames"), [178])
+        self.assertIn("Page detected", self.page.locator("#status").inner_text())
+
     def test_manifest_injects_into_deep_research_frames(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())
         content_script = manifest["content_scripts"][0]
