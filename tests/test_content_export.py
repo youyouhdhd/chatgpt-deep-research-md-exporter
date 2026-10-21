@@ -1041,11 +1041,15 @@ x^2 + y^2
             window.__headingFrames = [];
             window.__structuredProbes = [];
             window.__structuredMatchTitles = [];
+            window.__sourceOpenFrames = [];
             window.chrome = {{
               tabs: {{
                 query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
                 sendMessage: async (_tabId, message, options) => {{
-                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
+                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') {{
+                    window.__sourceOpenFrames.push(options?.frameId ?? 0);
+                    return {{ ok: true, openedSources: false }};
+                  }}
                   if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') {{
                     window.__structuredProbes.push(options?.frameId ?? 0);
                     window.__structuredMatchTitles.push(message?.matchTitle || '');
@@ -1088,11 +1092,12 @@ x^2 + y^2
         self.page.wait_for_function("!document.querySelector('#downloadButton').disabled")
 
         # 快路径命中：先收集各 frame 标题（报告 frame 优先），再带 matchTitle 探测
-        # 顶层 payload，完全不需要逐 frame 导出。
+        # 顶层 payload，完全不需要逐 frame 导出，也不得点击页面上的任何控件。
         self.assertEqual(self.page.evaluate("window.__structuredProbes"), [0])
         self.assertEqual(self.page.evaluate("window.__structuredMatchTitles"), ["电子围栏结构化报告"])
         self.assertEqual(self.page.evaluate("window.__headingFrames"), [7, 0])
         self.assertEqual(self.page.evaluate("window.__exportFrames"), [])
+        self.assertEqual(self.page.evaluate("window.__sourceOpenFrames"), [])
         self.assertIn("Page detected", self.page.locator("#status").inner_text())
         self.assertIn("电子围栏结构化报告", self.page.locator("#summary").inner_text())
 
@@ -1198,6 +1203,50 @@ x^2 + y^2
         status_text = self.page.locator("#status").inner_text()
         self.assertIn("Fast mode", status_text)
         self.assertTrue(self.page.locator("#downloadButton").is_disabled())
+
+    def test_open_sources_clicks_only_within_fullscreen_layer(self):
+        # 多报告会话：会话流里旧报告的“Sources”控件不能被点击——那会把视图
+        # 切换到别的报告；只有当前全屏层内的控件可以展开。
+        body = f"""
+        <!doctype html><html><body>
+          <main>
+            <div data-message-author-role="assistant">
+              <button aria-expanded="false" onclick="window.__conversationClicked = true">Sources and activity</button>
+            </div>
+          </main>
+          <dialog open style="width:100vw;height:100vh">
+            <h1>Fullscreen Report</h1>
+            <button aria-expanded="false" onclick="window.__layerClicked = true">Sources and activity</button>
+          </dialog>
+        </body></html>
+        """
+        self.page.route(
+            "**/*",
+            lambda route: route.fulfill(
+                status=200, content_type="text/html; charset=utf-8", body=body
+            ),
+        )
+        self.page.add_init_script(
+            """
+            window.chrome = {
+              runtime: {
+                onMessage: { addListener(listener) { window.__exportListener = listener; } }
+              }
+            };
+            """
+        )
+        self.page.goto(TARGET_URL, wait_until="domcontentloaded")
+        self.page.add_script_tag(path=str(CONTENT_SCRIPT))
+
+        response = self.page.evaluate(
+            """() => new Promise((resolve) => {
+                window.__exportListener({ type: 'DEEP_RESEARCH_OPEN_SOURCES' }, null, resolve);
+            })"""
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertTrue(self.page.evaluate("window.__layerClicked === true"))
+        self.assertNotEqual(True, self.page.evaluate("window.__conversationClicked === true"))
 
     def test_manifest_injects_into_deep_research_frames(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())

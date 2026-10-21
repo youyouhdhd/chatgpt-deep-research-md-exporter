@@ -399,23 +399,10 @@ async function sendExportMessage(tab, message) {
 
   if (!orderedFrameIds.includes(0)) orderedFrameIds.push(0);
 
-  let openedSources = false;
-  // 控制按钮与报告正文可能分属父子 frame；先跨 frame 展开来源，再读取正文。
-  for (const frameId of orderedFrameIds) {
-    try {
-      const response = await chrome.tabs.sendMessage(tab.id, {
-        type: 'DEEP_RESEARCH_OPEN_SOURCES',
-      }, { frameId });
-      openedSources ||= response?.openedSources === true;
-    } catch {}
-  }
-  if (openedSources) {
-    await new Promise((resolve) => window.setTimeout(resolve, 1000));
-  }
-
   // 导出方式：auto（默认）= 快速数据优先、DOM 兜底；fast = 仅快速，未命中直接报错；
   // slow = 跳过快速路径，始终按渲染页面逐个展开 citation（慢但完全跟随当前 DOM）。
-  // 标题收集保留：slow 模式也用它把不可见的旧报告 frame 排到最后。
+  // 快速路径必须先于任何页面点击执行：展开来源面板会真实点击页面控件，多报告会话
+  // 里可能把 ChatGPT 的视图切换到别的报告，导致后续标题收集与导出认错目标。
   let headingEntries = [];
   if (message?.type === 'DEEP_RESEARCH_EXPORT_MARKDOWN') {
     const exportMode = currentExportMode();
@@ -427,6 +414,20 @@ async function sendExportMessage(tab, message) {
         throw new Error(t('error_fast_mode_missed'));
       }
     }
+  }
+
+  // DOM 兜底：先跨 frame 展开来源面板（content 侧已限定只点击当前全屏层内的控件）。
+  let openedSources = false;
+  for (const frameId of orderedFrameIds) {
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: 'DEEP_RESEARCH_OPEN_SOURCES',
+      }, { frameId });
+      openedSources ||= response?.openedSources === true;
+    } catch {}
+  }
+  if (openedSources) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
   }
 
   let lastError = null;

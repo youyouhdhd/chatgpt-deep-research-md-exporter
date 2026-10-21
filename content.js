@@ -473,7 +473,18 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
   }
 
   function maybeOpenSourcesPanels() {
-    const candidates = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], summary'))
+    // 多报告会话：直接对话页的会话流里，每个报告都有自己的“Sources / 来源”控件。
+    // 全屏层之外（会话流里）的控件不能点击——点击旧报告的控件会让 ChatGPT 把
+    // 视图切换到那份报告。非直接对话页（分享页 / 报告 iframe 内）不受影响。
+    let scope = document;
+    if (isDirectConversationPage()) {
+      const layer = Array.from(document.querySelectorAll(FULLSCREEN_LAYER_SELECTOR))
+        .find((node) => isFullscreenLayer(node));
+      if (!layer) return false;
+      scope = layer;
+    }
+
+    const candidates = Array.from(scope.querySelectorAll('button, [role="button"], [role="tab"], summary'))
       .filter((node) => isVisible(node))
       .filter((node) => looksLikeSourceHeading(node.textContent || node.getAttribute?.('aria-label') || ''));
 
