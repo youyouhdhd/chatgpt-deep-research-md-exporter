@@ -6,7 +6,7 @@
 
 ## 本 Fork 的更新
 
-本 fork（v0.2.15）基于原版插件（[qpwm06/chatgpt-deep-research-md-exporter](https://github.com/qpwm06/chatgpt-deep-research-md-exporter)，v0.2.5）增强，主要区别：
+本 fork（v0.2.16）基于原版插件（[qpwm06/chatgpt-deep-research-md-exporter](https://github.com/qpwm06/chatgpt-deep-research-md-exporter)，v0.2.5）增强，主要区别：
 
 - **可用的下载与正确文件名** — 下载文件以插件识别出的报告标题 + 本地时间命名，如 `gpt-电子围栏技术调研报告_2026-10-15_11-02.md`；Chrome 会忽略 `chrome.downloads.download` 的 `filename` 参数（导致文件名变成 blob UUID 乱码），因此改用 anchor `download` 属性 + 自包含 data URL 实现可靠命名
 - **全屏报告识别修复** — 内容脚本注入扩展到跨域报告 iframe（`*.web-sandbox.oaiusercontent.com`），解决"没有识别到当前全屏报告"的识别失败
@@ -61,13 +61,14 @@ ChatGPT Deep Research 默认导出有时会保留 ChatGPT 内部引用格式，�
 2. 将报告打开为全屏视图
 3. 点击插件图标
 4. 可选设置标题前缀，默认：`gpt-`
-5. 点击 `开始识别`
-6. 如果按钮可用，可点击 `LaTeX $ 修正`，将 `\[ ... \]` 或仅含数学内容的 `[ ... ]` 块转换为 `$$ ... $$`
-7. 点击 `下载 Markdown` 或 `复制 Markdown`
+5. 可选选择导出方式：`自动`（默认，优先快速内嵌数据、失败转 DOM）、`仅快速`（内嵌数据未命中时直接报错）、`仅 DOM`（始终按渲染页面逐个展开，慢但与屏幕内容一致）
+6. 点击 `开始识别`
+7. 如果按钮可用，可点击 `LaTeX $ 修正`，将 `\[ ... \]` 或仅含数学内容的 `[ ... ]` 块转换为 `$$ ... $$`
+8. 点击 `下载 Markdown` 或 `复制 Markdown`
 
 ## 导出行为
 
-- 优先从页面内嵌数据流直接重建报告（秒级完成、保留原始 LaTeX 分隔符与完整引用映射）；仅当内嵌数据缺失或与当前打开的报告不一致时，才退回逐个展开 citation 轮播的 DOM 方式
+- 导出方式可在弹窗中选择：自动模式优先从页面内嵌数据流直接重建报告（秒级完成、保留原始 LaTeX 分隔符与完整引用映射），仅当内嵌数据缺失或与当前打开的报告不一致时才退回逐个展开 citation 轮播的 DOM 方式；仅快速模式不做回退；仅 DOM 模式完全跳过内嵌数据
 - 下载文件名使用 `报告标题 + 导出时间`，例如 `gpt-报告标题_2026-10-13_19-30.md`；优先使用插件识别出的报告标题，浏览器标签页标题仅在有意义时（非空且不是会话 ID 等机器标识）作为兜底
 - 导出的标题可加前缀，默认 `gpt-`
 - 正文引用会转换成 `[[N](url)]` 形式的 Markdown 内联链接（中括号在链接外侧），渲染为带中括号的 `[N]`

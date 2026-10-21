@@ -6,15 +6,18 @@ const latexFixButton = document.getElementById('latexFixButton');
 const downloadButton = document.getElementById('downloadButton');
 const copyButton = document.getElementById('copyButton');
 const titlePrefixInput = document.getElementById('titlePrefixInput');
+const exportModeSelect = document.getElementById('exportModeSelect');
 const localeEnButton = document.getElementById('localeEnButton');
 const localeZhButton = document.getElementById('localeZhButton');
 const heroTitleNode = document.getElementById('heroTitle');
 const heroSubtitleNode = document.getElementById('heroSubtitle');
 const prefixLabelNode = document.getElementById('prefixLabel');
+const exportModeLabelNode = document.getElementById('exportModeLabel');
 const tipsTitleNode = document.getElementById('tipsTitle');
 const tip1Node = document.getElementById('tip1');
 const tip2Node = document.getElementById('tip2');
 const tip3Node = document.getElementById('tip3');
+const tip4Node = document.getElementById('tip4');
 
 let cachedExport = null;
 let cachedTabId = null;
@@ -27,6 +30,10 @@ const MESSAGES = {
     hero_title: 'Markdown Export',
     hero_subtitle: 'Export the open full-screen report from a ChatGPT conversation to `.md`.',
     prefix_label: 'Title Prefix',
+    mode_label: 'Export Mode',
+    mode_auto: 'Auto — fast data first, DOM fallback',
+    mode_fast: 'Fast only — embedded data',
+    mode_slow: 'DOM only — precise, slower',
     status_idle: 'Open the report full screen, then start detection.',
     status_checking: 'Checking current tab…',
     status_generating: 'Generating Markdown…',
@@ -50,6 +57,7 @@ const MESSAGES = {
     summary_latex_fixes: 'LaTeX Fixes Available',
     error_tab: 'No readable active tab was found.',
     error_page: 'Please open a Deep Research report in a ChatGPT conversation first.',
+    error_fast_mode_missed: 'Fast mode found no embedded data matching the open report. Try Auto or DOM-only mode.',
     generic_export_failed: 'Export failed.',
     generic_download_failed: 'Download failed.',
     generic_copy_failed: 'Copy failed.',
@@ -58,6 +66,10 @@ const MESSAGES = {
     hero_title: 'Markdown 导出',
     hero_subtitle: '直接把 ChatGPT 对话中已打开的全屏报告导出为 `.md`。',
     prefix_label: '标题前缀',
+    mode_label: '导出方式',
+    mode_auto: '自动 — 优先快速数据，失败转 DOM',
+    mode_fast: '仅快速 — 页面内嵌数据',
+    mode_slow: '仅 DOM — 精确但较慢',
     status_idle: '请先打开目标报告的全屏视图，然后点击开始识别。',
     status_checking: '正在检查当前标签页…',
     status_generating: '正在生成 Markdown…',
@@ -81,6 +93,7 @@ const MESSAGES = {
     summary_latex_fixes: '可修正 LaTeX',
     error_tab: '没有可用的当前标签页。',
     error_page: '请先进入具体 ChatGPT 对话并打开 Deep Research 全屏报告。',
+    error_fast_mode_missed: '快速模式没有匹配到当前打开报告的内嵌数据。可改用“自动”或“仅 DOM”模式重试。',
     generic_export_failed: '导出失败。',
     generic_download_failed: '下载失败。',
     generic_copy_failed: '复制失败。',
@@ -126,6 +139,10 @@ function applyLocale() {
   heroTitleNode.textContent = t('hero_title');
   heroSubtitleNode.textContent = t('hero_subtitle');
   prefixLabelNode.textContent = t('prefix_label');
+  exportModeLabelNode.textContent = t('mode_label');
+  exportModeSelect.options[0].textContent = t('mode_auto');
+  exportModeSelect.options[1].textContent = t('mode_fast');
+  exportModeSelect.options[2].textContent = t('mode_slow');
   startButton.textContent = t('start_button');
   latexFixButton.textContent = t('latex_fix_button');
   downloadButton.textContent = t('download_button');
@@ -134,6 +151,7 @@ function applyLocale() {
   tip1Node.textContent = t('tip1');
   tip2Node.textContent = t('tip2');
   tip3Node.textContent = t('tip3');
+  tip4Node.textContent = t('tip4');
   localeEnButton.classList.toggle('active', currentLocale === 'en');
   localeZhButton.classList.toggle('active', currentLocale === 'zh-CN');
 }
@@ -161,6 +179,30 @@ async function savePrefix(prefix) {
 
 function currentPrefix() {
   return String(titlePrefixInput.value || '').trim();
+}
+
+function readStoredExportMode() {
+  try {
+    const stored = String(localStorage.getItem('exportMode') || 'auto');
+    return ['auto', 'fast', 'slow'].includes(stored) ? stored : 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+function writeStoredExportMode(mode) {
+  try {
+    localStorage.setItem('exportMode', mode);
+  } catch {}
+}
+
+function loadExportMode() {
+  exportModeSelect.value = readStoredExportMode();
+}
+
+function currentExportMode() {
+  const mode = String(exportModeSelect.value || 'auto');
+  return ['auto', 'fast', 'slow'].includes(mode) ? mode : 'auto';
 }
 
 function setBusy(isBusy) {
@@ -371,14 +413,20 @@ async function sendExportMessage(tab, message) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
   }
 
-  // 快路径：顶层页面的内嵌 payload 含报告原始 Markdown（LaTeX 完整）与完整引用映射。
-  // 同一会话多份报告时，按"可见报告 frame 的标题"选出当前打开的那一份，
-  // 避免逐个打开 citation 轮播（上百处引用需一两分钟）的同时避免错选第一份。
+  // 导出方式：auto（默认）= 快速数据优先、DOM 兜底；fast = 仅快速，未命中直接报错；
+  // slow = 跳过快速路径，始终按渲染页面逐个展开 citation（慢但完全跟随当前 DOM）。
+  // 标题收集保留：slow 模式也用它把不可见的旧报告 frame 排到最后。
   let headingEntries = [];
   if (message?.type === 'DEEP_RESEARCH_EXPORT_MARKDOWN') {
+    const exportMode = currentExportMode();
     headingEntries = await collectReportFrameHeadings(tab, orderedFrameIds);
-    const fastResponse = await tryStructuredFastPath(tab, message, headingEntries);
-    if (fastResponse) return fastResponse;
+    if (exportMode !== 'slow') {
+      const fastResponse = await tryStructuredFastPath(tab, message, headingEntries);
+      if (fastResponse) return fastResponse;
+      if (exportMode === 'fast') {
+        throw new Error(t('error_fast_mode_missed'));
+      }
+    }
   }
 
   let lastError = null;
@@ -621,9 +669,21 @@ titlePrefixInput.addEventListener('change', async () => {
   setStatus(t('status_idle'));
   setBusy(false);
 });
+exportModeSelect.addEventListener('change', async () => {
+  writeStoredExportMode(currentExportMode());
+  // 导出方式变化后旧缓存结果不再可靠，清空并回到待识别状态。
+  cachedExport = null;
+  cachedTabId = null;
+  cachedTabUrl = null;
+  renderWarnings([]);
+  summaryNode.classList.add('hidden');
+  setStatus(t('status_idle'));
+  setBusy(false);
+});
 document.addEventListener('DOMContentLoaded', async () => {
   await loadLocale();
   await loadPrefix();
+  loadExportMode();
   setStatus(t('status_idle'));
   setBusy(false);
 });

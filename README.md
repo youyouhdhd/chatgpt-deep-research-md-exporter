@@ -6,7 +6,7 @@ Chrome extension for exporting an open **ChatGPT Deep Research full-screen repor
 
 ## Updates in This Fork
 
-This fork (v0.2.15) extends the original extension ([qpwm06/chatgpt-deep-research-md-exporter](https://github.com/qpwm06/chatgpt-deep-research-md-exporter), v0.2.5) with:
+This fork (v0.2.16) extends the original extension ([qpwm06/chatgpt-deep-research-md-exporter](https://github.com/qpwm06/chatgpt-deep-research-md-exporter), v0.2.5) with:
 
 - **Working download with correct file names** — downloaded files are named after the detected report title plus a local timestamp, e.g. `gpt-Report Title_2026-10-15_11-02.md`; Chrome ignores the `filename` option of `chrome.downloads.download` (which used to produce blob-UUID file names), so downloads are issued through an anchor `download` attribute with a self-contained data URL instead
 - **Fullscreen report detection fix** — the content script is now also injected into the cross-origin report iframe (`*.web-sandbox.oaiusercontent.com`), fixing the "没有识别到当前全屏报告" failure on fullscreen reports
@@ -61,13 +61,14 @@ This extension rebuilds the report from the currently open conversation page, so
 2. Open the report in full-screen view
 3. Click the extension icon
 4. Optionally set a title prefix, default: `gpt-`
-5. Click `Start Detection`
-6. If available, click `Fix LaTeX $` to convert `\[ ... \]` or math-only `[ ... ]` blocks to `$$ ... $$`
-7. Click `Download Markdown` or `Copy Markdown`
+5. Optionally pick an export mode: `Auto` (fast embedded data first, DOM fallback — default), `Fast only` (fail with an error when no embedded data matches), or `DOM only` (always walk the rendered report; slower but exactly follows what is on screen)
+6. Click `Start Detection`
+7. If available, click `Fix LaTeX $` to convert `\[ ... \]` or math-only `[ ... ]` blocks to `$$ ... $$`
+8. Click `Download Markdown` or `Copy Markdown`
 
 ## Output Behavior
 
-- The report is rebuilt from the page's embedded data stream first (seconds, keeps original LaTeX delimiters and the full citation map); the slower per-citation carousel DOM walk only runs when the embedded data is missing or does not match the open report
+- The export mode is user-selectable in the popup: Auto rebuilds from the page's embedded data stream first (seconds, keeps original LaTeX delimiters and the full citation map) and only falls back to the slower per-citation carousel DOM walk when the embedded data is missing or does not match the open report; Fast only skips the fallback; DOM only skips the embedded data entirely
 - Downloaded files are named `report title + export time`, e.g. `gpt-Report Title_2026-10-13_19-30.md`; the report title detected by the extension is used first, and the ChatGPT tab title is only used as a fallback when it is meaningful (not empty and not a machine identifier such as a conversation ID)
 - The exported title can be prefixed, default `gpt-`
 - Inline citations are converted to Markdown links in the form `[[N](url)]`, which renders as a bracketed `[N]`

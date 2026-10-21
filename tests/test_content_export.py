@@ -1096,6 +1096,109 @@ x^2 + y^2
         self.assertIn("Page detected", self.page.locator("#status").inner_text())
         self.assertIn("电子围栏结构化报告", self.page.locator("#summary").inner_text())
 
+    def test_export_mode_slow_skips_fast_path(self):
+        # “仅 DOM”模式下完全不探测内嵌 payload，直接走逐 frame 导出。
+        self.page.add_init_script(
+            f"""
+            window.__exportFrames = [];
+            window.__structuredProbes = [];
+            window.chrome = {{
+              tabs: {{
+                query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
+                sendMessage: async (_tabId, message, options) => {{
+                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
+                  if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') {{
+                    window.__structuredProbes.push(options?.frameId ?? 0);
+                    return {{ ok: false }};
+                  }}
+                  if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
+                    return {{
+                      ok: true,
+                      heading: options?.frameId === 7 ? 'Selected Fullscreen Report' : '',
+                      visible: options?.frameId === 7,
+                    }};
+                  }}
+                  window.__exportFrames.push(options?.frameId ?? 0);
+                  if (options?.frameId !== 7) return {{ ok: false, error: 'Wrong frame' }};
+                  return {{
+                    ok: true,
+                    result: {{
+                      title: 'gpt-Selected Fullscreen Report',
+                      filename: 'gpt-Selected Fullscreen Report',
+                      markdown: '# gpt-Selected Fullscreen Report\\n\\nSlow path body.',
+                      sourceCount: 1,
+                      citationCount: 1,
+                      warnings: [],
+                    }},
+                  }};
+                }},
+              }},
+              webNavigation: {{
+                getAllFrames: async () => [
+                  {{ frameId: 0, parentFrameId: -1, url: {json.dumps(TARGET_URL)} }},
+                  {{ frameId: 7, parentFrameId: 0, url: 'https://connector-openai-deep-research.web-sandbox.oaiusercontent.com/' }},
+                ],
+              }},
+            }};
+            """
+        )
+        self.page.goto((ROOT / "popup.html").as_uri(), wait_until="domcontentloaded")
+        self.page.select_option("#exportModeSelect", "slow")
+
+        self.page.locator("#startButton").click()
+        self.page.wait_for_function("!document.querySelector('#downloadButton').disabled")
+
+        self.assertEqual(self.page.evaluate("window.__structuredProbes"), [])
+        self.assertEqual(self.page.evaluate("window.__exportFrames"), [7])
+        self.assertIn("Page detected", self.page.locator("#status").inner_text())
+
+    def test_export_mode_fast_reports_error_when_unmatched(self):
+        # “仅快速”模式下内嵌数据未命中时直接报错，不回退到慢速路径。
+        self.page.add_init_script(
+            f"""
+            window.__exportFrames = [];
+            window.__structuredProbes = [];
+            window.chrome = {{
+              tabs: {{
+                query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
+                sendMessage: async (_tabId, message, options) => {{
+                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
+                  if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') {{
+                    window.__structuredProbes.push(options?.frameId ?? 0);
+                    return {{ ok: false }};
+                  }}
+                  if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
+                    return {{
+                      ok: true,
+                      heading: options?.frameId === 7 ? 'Open Report' : '',
+                      visible: options?.frameId === 7,
+                    }};
+                  }}
+                  window.__exportFrames.push(options?.frameId ?? 0);
+                  return {{ ok: false, error: 'slow path must not run in fast mode' }};
+                }},
+              }},
+              webNavigation: {{
+                getAllFrames: async () => [
+                  {{ frameId: 0, parentFrameId: -1, url: {json.dumps(TARGET_URL)} }},
+                  {{ frameId: 7, parentFrameId: 0, url: 'https://connector-openai-deep-research.web-sandbox.oaiusercontent.com/' }},
+                ],
+              }},
+            }};
+            """
+        )
+        self.page.goto((ROOT / "popup.html").as_uri(), wait_until="domcontentloaded")
+        self.page.select_option("#exportModeSelect", "fast")
+
+        self.page.locator("#startButton").click()
+        self.page.wait_for_function("!document.querySelector('#startButton').disabled")
+
+        self.assertEqual(self.page.evaluate("window.__structuredProbes"), [0])
+        self.assertEqual(self.page.evaluate("window.__exportFrames"), [])
+        status_text = self.page.locator("#status").inner_text()
+        self.assertIn("Fast mode", status_text)
+        self.assertTrue(self.page.locator("#downloadButton").is_disabled())
+
     def test_manifest_injects_into_deep_research_frames(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())
         content_script = manifest["content_scripts"][0]
