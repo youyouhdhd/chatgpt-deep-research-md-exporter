@@ -472,6 +472,29 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     return TOC_HEADING_RE.test(normalizeText(text));
   }
 
+  function findFullscreenIframeHeading() {
+    // 新架构：全屏报告渲染在同源 about:blank iframe 里，querySelector 不会跨文档边界，
+    // 必须显式进入 iframe 的 contentDocument 才能读到当前打开报告的标题。
+    // 跨域 iframe（web-sandbox 等）访问 contentDocument 会抛错或为 null，自动跳过。
+    const explicitReports = Array.from(document.querySelectorAll(
+      '[data-testid*="deep-research" i], [data-testid*="research-report" i], [data-testid*="report-view" i]',
+    ));
+    const layers = Array.from(document.querySelectorAll(FULLSCREEN_LAYER_SELECTOR))
+      .filter((node) => isFullscreenLayer(node));
+    for (const scope of [...layers, ...explicitReports]) {
+      for (const iframe of Array.from(scope.querySelectorAll('iframe'))) {
+        try {
+          const doc = iframe.contentDocument;
+          if (!doc || !doc.body) continue;
+          const heading = doc.querySelector('h1');
+          const text = normalizeText(heading?.textContent || '');
+          if (text) return text;
+        } catch {}
+      }
+    }
+    return '';
+  }
+
   function maybeOpenSourcesPanels() {
     // 多报告会话：直接对话页的会话流里，每个报告都有自己的“Sources / 来源”控件。
     // 全屏层之外（会话流里）的控件不能点击——点击旧报告的控件会让 ChatGPT 把
@@ -2294,10 +2317,14 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       // visible 标记报告 frame 是否真实可见——同一会话多份报告时，未打开的旧报告
       // iframe 仍可能挂在 DOM 上（视口为 0），不能让它抢先成为匹配目标。
       const root = isDirectConversationPage() ? findReportRootFromFullscreenLayer() : findReportRoot();
-      const heading = root ? (findTitleElement(root) || root.querySelector('h1')) : null;
+      let heading = root ? (findTitleElement(root) || root.querySelector('h1')) : null;
+      let headingText = normalizeText(heading?.textContent || '');
+      if (!headingText && isDirectConversationPage()) {
+        headingText = findFullscreenIframeHeading();
+      }
       sendResponse({
         ok: true,
-        heading: normalizeText(heading?.textContent || ''),
+        heading: headingText,
         visible: !document.hidden && window.innerWidth > 0 && window.innerHeight > 0,
       });
       return undefined;

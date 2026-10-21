@@ -356,14 +356,18 @@ async function collectReportFrameHeadings(tab, orderedFrameIds) {
   return { entries, frame0Unreachable };
 }
 
-async function tryStructuredFastPath(tab, message, headingEntries, trace) {
-  // 同一会话可能包含多份深度调研：内嵌数据流里第一份不一定是当前打开的那份。
-  // 顶层页面的标题来自全屏层（新架构下 about:blank 报告 iframe 与主页面同源，
-  // 可直接读到当前打开的那份），最可靠；否则退回"可见"报告 frame 的标题。
-  const open = headingEntries.find((entry) => entry.frameId === 0)
+function pickOpenHeadingEntry(headingEntries) {
+  // 顶层页面的标题来自全屏层（新架构下同源 about:blank 报告 iframe 需显式跨进
+  // contentDocument 读取，见 content.js），指向当前打开的那一份，最可靠；
+  // 否则退回第一个"可见"报告 frame（about:blank iframe 可能全部报可见，仅作兜底）。
+  return headingEntries.find((entry) => entry.frameId === 0)
     || headingEntries.find((entry) => entry.visible)
-    || headingEntries[0];
-  if (!open) {
+    || headingEntries[0]
+    || null;
+}
+
+async function tryStructuredFastPath(tab, message, openEntry, trace) {
+  if (!openEntry) {
     trace.push({ step: 'fast-reject', reason: 'no-open-heading' });
     return null;
   }
@@ -374,21 +378,21 @@ async function tryStructuredFastPath(tab, message, headingEntries, trace) {
       type: 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT',
       titlePrefix: message?.titlePrefix,
       sourceUrl: message?.sourceUrl,
-      matchTitle: open.heading,
+      matchTitle: openEntry.heading,
     }, { frameId: 0 });
   } catch (error) {
-    trace.push({ step: 'fast-reject', reason: 'probe-error', matchTitle: open.heading, error: String(error?.message || error) });
+    trace.push({ step: 'fast-reject', reason: 'probe-error', matchTitle: openEntry.heading, error: String(error?.message || error) });
     return null;
   }
   if (!structured?.ok || !structured?.result?.markdown) {
-    trace.push({ step: 'fast-reject', reason: structured?.ok ? 'no-markdown' : 'no-structured-result', matchTitle: open.heading, error: structured?.error || '' });
+    trace.push({ step: 'fast-reject', reason: structured?.ok ? 'no-markdown' : 'no-structured-result', matchTitle: openEntry.heading, error: structured?.error || '' });
     return null;
   }
 
   // citation 映射未命中时 payload 数据不完整，交给 DOM 路径兜底。
   const citationCount = Number(structured.result.citationCount) || 0;
   if (citationCount === 0) {
-    trace.push({ step: 'fast-reject', reason: 'zero-citations', matchTitle: open.heading, structuredTitle: structured.result.title });
+    trace.push({ step: 'fast-reject', reason: 'zero-citations', matchTitle: openEntry.heading, structuredTitle: structured.result.title });
     return null;
   }
 
@@ -400,11 +404,11 @@ async function tryStructuredFastPath(tab, message, headingEntries, trace) {
     return null;
   }
   // 双保险：选中的 payload 标题必须仍与打开的报告标题对应。
-  if (!titlesReferToSameReport(candidate, open.heading)) {
-    trace.push({ step: 'fast-reject', reason: 'title-mismatch', matchTitle: open.heading, structuredTitle: candidate });
+  if (!titlesReferToSameReport(candidate, openEntry.heading)) {
+    trace.push({ step: 'fast-reject', reason: 'title-mismatch', matchTitle: openEntry.heading, structuredTitle: candidate });
     return null;
   }
-  trace.push({ step: 'fast-accept', matchTitle: open.heading, structuredTitle: candidate });
+  trace.push({ step: 'fast-accept', matchTitle: openEntry.heading, structuredTitle: candidate });
   return structured;
 }
 
@@ -500,19 +504,33 @@ async function sendExportMessageInner(tab, message, trace) {
   // 里可能把 ChatGPT 的视图切换到别的报告，导致后续标题收集与导出认错目标。
   let headingEntries = [];
   let frame0Unreachable = false;
+  let openFrameIds = [];
   if (message?.type === 'DEEP_RESEARCH_EXPORT_MARKDOWN') {
     const exportMode = currentExportMode();
     const headingProbe = await collectReportFrameHeadings(tab, orderedFrameIds);
     headingEntries = headingProbe.entries;
     frame0Unreachable = headingProbe.frame0Unreachable;
     trace.push({ step: 'headings', entries: headingEntries, frame0Unreachable });
+    // 统一确定"当前打开的报告"：快速路径用它匹配 payload，DOM 兜底用它排导出顺序。
+    const openEntry = pickOpenHeadingEntry(headingEntries);
+    openFrameIds = openEntry && openEntry.frameId === 0
+      ? headingEntries
+        .filter((entry) => entry.frameId !== 0 && titlesReferToSameReport(entry.heading, openEntry.heading))
+        .map((entry) => entry.frameId)
+      : (openEntry ? [openEntry.frameId] : []);
+    trace.push({
+      step: 'open-report',
+      heading: openEntry?.heading || '',
+      frameId: openEntry?.frameId ?? null,
+      matchedFrameIds: openFrameIds,
+    });
     // 扩展刚重载而页面未刷新：顶层内容脚本失联且没有任何 frame 提供报告标题，
     // 任何路径都无法工作，直接给可执行的提示而不是让用户看到一连串连接错误。
     if (frame0Unreachable && headingEntries.length === 0) {
       throw new Error(t('error_stale_page'));
     }
     if (exportMode !== 'slow') {
-      const fastResponse = await tryStructuredFastPath(tab, message, headingEntries, trace);
+      const fastResponse = await tryStructuredFastPath(tab, message, openEntry, trace);
       if (fastResponse) return fastResponse;
       await traceStructuredTitles(tab, trace);
       if (exportMode === 'fast') {
@@ -541,13 +559,17 @@ async function sendExportMessageInner(tab, message, trace) {
   // URL 无法识别）。报告 frame 以"标题探测结果"识别：有标题的可见 frame 最优先，
   // 隐藏的报告 frame 垫底——隐藏的旧报告 iframe 若先命中会把导出指向错误的报告。
   const headingFrameIds = new Set(headingEntries.map((entry) => entry.frameId));
-  const visibleHeadingFrameIds = headingEntries.filter((entry) => entry.visible).map((entry) => entry.frameId);
-  const hiddenHeadingFrameIds = headingEntries.filter((entry) => !entry.visible).map((entry) => entry.frameId);
+  const openFrameIdSet = new Set(openFrameIds);
   const exportFrameOrder = [
-    ...visibleHeadingFrameIds,
+    ...openFrameIds,
+    ...headingEntries
+      .filter((entry) => entry.visible && !openFrameIdSet.has(entry.frameId))
+      .map((entry) => entry.frameId),
     ...orderedFrameIds.filter((frameId) => !headingFrameIds.has(frameId) && frameId !== 0),
     0,
-    ...hiddenHeadingFrameIds,
+    ...headingEntries
+      .filter((entry) => !entry.visible && !openFrameIdSet.has(entry.frameId))
+      .map((entry) => entry.frameId),
   ].filter((frameId, index, items) => Number.isInteger(frameId) && items.indexOf(frameId) === index);
   for (const frameId of exportFrameOrder) {
     try {

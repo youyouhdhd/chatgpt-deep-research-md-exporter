@@ -1373,6 +1373,88 @@ x^2 + y^2
         # 调试按钮在有一次识别记录后可用
         self.assertFalse(self.page.locator("#debugButton").is_disabled())
 
+    def test_heading_reads_report_inside_fullscreen_iframe(self):
+        # 新架构：全屏报告在同源 about:blank iframe 里；主页面标题探测必须显式
+        # 进入 iframe 的 contentDocument 读取（querySelector 不跨文档边界）。
+        body = """
+        <!doctype html><html><body>
+          <main></main>
+          <dialog open style="width:100vw;height:100vh">
+            <iframe srcdoc="<article><h1>全屏层内的报告标题</h1><p>正文内容</p></article>"></iframe>
+          </dialog>
+        </body></html>
+        """
+        self.page.route(
+            "**/*",
+            lambda route: route.fulfill(
+                status=200, content_type="text/html; charset=utf-8", body=body
+            ),
+        )
+        self.page.add_init_script(
+            """
+            window.chrome = {
+              runtime: {
+                onMessage: { addListener(listener) { window.__exportListener = listener; } }
+              }
+            };
+            """
+        )
+        self.page.goto(TARGET_URL, wait_until="domcontentloaded")
+        self.page.add_script_tag(path=str(CONTENT_SCRIPT))
+        self.page.wait_for_function(
+            "() => document.querySelector('dialog iframe')?.contentDocument?.querySelector('h1')"
+        )
+
+        response = self.page.evaluate(
+            """() => new Promise((resolve) => {
+                window.__exportListener({ type: 'DEEP_RESEARCH_REPORT_HEADING' }, null, resolve);
+            })"""
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["heading"], "全屏层内的报告标题")
+
+    def test_export_targets_report_open_in_fullscreen_layer(self):
+        # 多报告且全部报告 frame 都"可见"（about:blank iframe 特性）时，
+        # 主页面全屏层读到的标题是唯一权威信号：导出必须选它指向的那份报告。
+        self.page.add_init_script(
+            f"""
+            window.__exportFrames = [];
+            window.chrome = {{
+              tabs: {{
+                query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
+                sendMessage: async (_tabId, message, options) => {{
+                  if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
+                  if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') return {{ ok: false }};
+                  if (message?.type === 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES') return {{ ok: true, items: [] }};
+                  if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
+                    if ((options?.frameId ?? 0) === 0) return {{ ok: true, heading: '第三份调研报告', visible: true }};
+                    if (options?.frameId === 252) return {{ ok: true, heading: '第一份调研报告', visible: true }};
+                    if (options?.frameId === 253) return {{ ok: true, heading: '第三份调研报告', visible: true }};
+                    return {{ ok: true, heading: '' }};
+                  }}
+                  window.__exportFrames.push(options?.frameId ?? 0);
+                  return {{ ok: true, result: {{ title: 'gpt-' + options?.frameId, filename: 'x', markdown: '# ok', sourceCount: 1, citationCount: 1, warnings: [] }} }};
+                }},
+              }},
+              webNavigation: {{
+                getAllFrames: async () => [
+                  {{ frameId: 0, parentFrameId: -1, url: {json.dumps(TARGET_URL)} }},
+                  {{ frameId: 252, parentFrameId: 0, url: 'about:blank' }},
+                  {{ frameId: 253, parentFrameId: 0, url: 'about:blank' }},
+                ],
+              }},
+            }};
+            """
+        )
+        self.page.goto((ROOT / "popup.html").as_uri(), wait_until="domcontentloaded")
+
+        self.page.locator("#startButton").click()
+        self.page.wait_for_function("!document.querySelector('#downloadButton').disabled")
+
+        # 全屏层标题指向 253（第三份）：只有它应被导出
+        self.assertEqual(self.page.evaluate("window.__exportFrames"), [253])
+
     def test_manifest_injects_into_deep_research_frames(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())
         content_script = manifest["content_scripts"][0]
