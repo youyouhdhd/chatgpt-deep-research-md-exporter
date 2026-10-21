@@ -280,13 +280,38 @@ function titlesReferToSameReport(candidate, heading) {
   return shorter.length >= 6 && longer.includes(shorter);
 }
 
-async function tryStructuredFastPath(tab, message, orderedFrameIds) {
+async function collectReportFrameHeadings(tab, orderedFrameIds) {
+  const entries = [];
+  for (const frameId of orderedFrameIds) {
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: 'DEEP_RESEARCH_REPORT_HEADING',
+      }, { frameId });
+      if (response?.ok && normalizedCompareText(response.heading)) {
+        entries.push({
+          frameId,
+          heading: String(response.heading || ''),
+          visible: response.visible !== false,
+        });
+      }
+    } catch {}
+  }
+  return entries;
+}
+
+async function tryStructuredFastPath(tab, message, headingEntries) {
+  // 同一会话可能包含多份深度调研：内嵌数据流里第一份不一定是当前打开的那份。
+  // 先取"可见"报告 frame 的标题锁定目标，再让顶层按标题选出对应的 payload。
+  const open = headingEntries.find((entry) => entry.visible) || headingEntries[0];
+  if (!open) return null;
+
   let structured = null;
   try {
     structured = await chrome.tabs.sendMessage(tab.id, {
       type: 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT',
       titlePrefix: message?.titlePrefix,
       sourceUrl: message?.sourceUrl,
+      matchTitle: open.heading,
     }, { frameId: 0 });
   } catch {
     return null;
@@ -301,19 +326,9 @@ async function tryStructuredFastPath(tab, message, orderedFrameIds) {
   const rawTitle = String(structured.result.title || '');
   const candidate = prefix && rawTitle.startsWith(prefix) ? rawTitle.slice(prefix.length) : rawTitle;
   if (!normalizedCompareText(candidate)) return null;
-
-  // 与当前打开的全屏报告标题比对，确认 payload 里的报告就是用户打开的那一份。
-  for (const frameId of orderedFrameIds) {
-    try {
-      const headingResponse = await chrome.tabs.sendMessage(tab.id, {
-        type: 'DEEP_RESEARCH_REPORT_HEADING',
-      }, { frameId });
-      if (titlesReferToSameReport(candidate, headingResponse?.heading)) {
-        return structured;
-      }
-    } catch {}
-  }
-  return null;
+  // 双保险：选中的 payload 标题必须仍与打开的报告标题对应。
+  if (!titlesReferToSameReport(candidate, open.heading)) return null;
+  return structured;
 }
 
 async function sendExportMessage(tab, message) {
@@ -356,17 +371,31 @@ async function sendExportMessage(tab, message) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
   }
 
-  // 快路径：顶层页面的内嵌 payload 含报告原始 Markdown（LaTeX 完整）与完整引用映射，
-  // 标题与当前全屏报告一致时直接采用，避免逐个打开 citation 轮播（上百处引用需一两分钟）。
+  // 快路径：顶层页面的内嵌 payload 含报告原始 Markdown（LaTeX 完整）与完整引用映射。
+  // 同一会话多份报告时，按"可见报告 frame 的标题"选出当前打开的那一份，
+  // 避免逐个打开 citation 轮播（上百处引用需一两分钟）的同时避免错选第一份。
+  let headingEntries = [];
   if (message?.type === 'DEEP_RESEARCH_EXPORT_MARKDOWN') {
-    const fastResponse = await tryStructuredFastPath(tab, message, orderedFrameIds);
+    headingEntries = await collectReportFrameHeadings(tab, orderedFrameIds);
+    const fastResponse = await tryStructuredFastPath(tab, message, headingEntries);
     if (fastResponse) return fastResponse;
   }
 
   let lastError = null;
   const failedResponses = [];
   // Deep Research 正文位于跨域 iframe；逐帧请求可避免顶层错误抢先覆盖正确结果。
-  for (const frameId of orderedFrameIds) {
+  // 未打开（不可见）的报告 frame 排到最后：隐藏的旧报告 iframe 若先命中会把导出
+  // 指向错误的那一份报告。
+  const hiddenFrameIds = new Set(
+    headingEntries.filter((entry) => !entry.visible).map((entry) => entry.frameId),
+  );
+  const exportFrameOrder = hiddenFrameIds.size > 0
+    ? [
+        ...orderedFrameIds.filter((frameId) => !hiddenFrameIds.has(frameId)),
+        ...orderedFrameIds.filter((frameId) => hiddenFrameIds.has(frameId)),
+      ]
+    : orderedFrameIds;
+  for (const frameId of exportFrameOrder) {
     try {
       const response = await chrome.tabs.sendMessage(tab.id, message, { frameId });
       if (response?.ok) return response;

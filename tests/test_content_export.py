@@ -957,12 +957,90 @@ x^2 + y^2
             result["markdown"],
         )
 
+    def test_structured_export_selects_payload_matching_heading(self):
+        # 同一会话有多份深度调研时，数据流里有多个 report payload；
+        # 必须按当前打开报告的标题选 payload，而不是总取第一份。
+        def build_payload(title, marker, url):
+            report_md = f"# {title}\n\n正文引用 {marker} 出现。"
+            inner = {
+                "record": {
+                    "report_message": {"content": {"parts": [report_md]}, "status": "DONE"},
+                    "content_references": [
+                        {"matched_text": marker, "prefix": "", "safe_urls": [url]}
+                    ],
+                }
+            }
+            payload_json = json.dumps(
+                {"wrapper": json.dumps(inner, ensure_ascii=False)}, ensure_ascii=False
+            )
+            return f"streamController.enqueue({json.dumps(payload_json, ensure_ascii=False)});"
+
+        script = (
+            build_payload("第一份调研报告", "\ue200citeA\ue201", "https://example.com/first-source")
+            + build_payload("第二份调研报告", "\ue200citeB\ue201", "https://example.com/second-source")
+        )
+        body = f"<!doctype html><html><body><script>{script}</script></body></html>"
+
+        def run_structured(match_title):
+            return self.page.evaluate(
+                """(matchTitle) => new Promise((resolve) => {
+                    window.__exportListener(
+                      {
+                        type: 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT',
+                        titlePrefix: 'gpt-',
+                        sourceUrl: window.__sourceUrl,
+                        matchTitle,
+                      },
+                      null,
+                      resolve,
+                    );
+                })""",
+                match_title,
+            )
+
+        self.page.route(
+            "**/*",
+            lambda route: route.fulfill(
+                status=200, content_type="text/html; charset=utf-8", body=body
+            ),
+        )
+        self.page.add_init_script(
+            """
+            window.chrome = {
+              runtime: {
+                onMessage: { addListener(listener) { window.__exportListener = listener; } }
+              }
+            };
+            """
+        )
+        self.page.add_init_script(f"window.__sourceUrl = {json.dumps(TARGET_URL)}")
+        self.page.goto("https://chatgpt.com/share/s-multi-report", wait_until="domcontentloaded")
+        self.page.add_script_tag(path=str(CONTENT_SCRIPT))
+
+        # 打开的是第二份：按标题选中第二份 payload
+        second = run_structured("第二份调研报告")
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(second["result"]["title"], "gpt-第二份调研报告")
+        self.assertIn(r"[[1](https://example.com/second-source)]", second["result"]["markdown"])
+        self.assertNotIn("first-source", second["result"]["markdown"])
+
+        # 标题不匹配任何 payload 时返回失败，交给 DOM 路径兜底
+        missing = run_structured("不存在的报告标题")
+        self.assertFalse(missing["ok"])
+
+        # 不指定标题（分享页单报告场景）保持旧行为：取第一份
+        first = run_structured("")
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["result"]["title"], "gpt-第一份调研报告")
+        self.assertIn(r"[[1](https://example.com/first-source)]", first["result"]["markdown"])
+
     def test_fast_path_prefers_matching_structured_payload(self):
         self.page.add_init_script(
             f"""
             window.__exportFrames = [];
             window.__headingFrames = [];
             window.__structuredProbes = [];
+            window.__structuredMatchTitles = [];
             window.chrome = {{
               tabs: {{
                 query: async () => [{{ id: 42, url: {json.dumps(TARGET_URL)} }}],
@@ -970,6 +1048,7 @@ x^2 + y^2
                   if (message?.type === 'DEEP_RESEARCH_OPEN_SOURCES') return {{ ok: true, openedSources: false }};
                   if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') {{
                     window.__structuredProbes.push(options?.frameId ?? 0);
+                    window.__structuredMatchTitles.push(message?.matchTitle || '');
                     return {{
                       ok: true,
                       result: {{
@@ -984,7 +1063,11 @@ x^2 + y^2
                   }}
                   if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {{
                     window.__headingFrames.push(options?.frameId ?? 0);
-                    return {{ ok: true, heading: options?.frameId === 7 ? '电子围栏结构化报告' : '' }};
+                    return {{
+                      ok: true,
+                      heading: options?.frameId === 7 ? '电子围栏结构化报告' : '',
+                      visible: options?.frameId === 7,
+                    }};
                   }}
                   window.__exportFrames.push(options?.frameId ?? 0);
                   return {{ ok: false, error: 'slow path should not run' }};
@@ -1004,9 +1087,11 @@ x^2 + y^2
         self.page.locator("#startButton").click()
         self.page.wait_for_function("!document.querySelector('#downloadButton').disabled")
 
-        # 快路径命中：payload 探测 + 报告 frame 标题比对成功，完全不需要逐 frame 导出。
+        # 快路径命中：先收集各 frame 标题（报告 frame 优先），再带 matchTitle 探测
+        # 顶层 payload，完全不需要逐 frame 导出。
         self.assertEqual(self.page.evaluate("window.__structuredProbes"), [0])
-        self.assertEqual(self.page.evaluate("window.__headingFrames"), [7])
+        self.assertEqual(self.page.evaluate("window.__structuredMatchTitles"), ["电子围栏结构化报告"])
+        self.assertEqual(self.page.evaluate("window.__headingFrames"), [7, 0])
         self.assertEqual(self.page.evaluate("window.__exportFrames"), [])
         self.assertIn("Page detected", self.page.locator("#status").inner_text())
         self.assertIn("电子围栏结构化报告", self.page.locator("#summary").inner_text())

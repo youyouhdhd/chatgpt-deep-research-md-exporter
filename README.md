@@ -6,11 +6,12 @@ Chrome extension for exporting an open **ChatGPT Deep Research full-screen repor
 
 ## Updates in This Fork
 
-This fork (v0.2.14) extends the original extension ([qpwm06/chatgpt-deep-research-md-exporter](https://github.com/qpwm06/chatgpt-deep-research-md-exporter), v0.2.5) with:
+This fork (v0.2.15) extends the original extension ([qpwm06/chatgpt-deep-research-md-exporter](https://github.com/qpwm06/chatgpt-deep-research-md-exporter), v0.2.5) with:
 
 - **Working download with correct file names** — downloaded files are named after the detected report title plus a local timestamp, e.g. `gpt-Report Title_2026-10-15_11-02.md`; Chrome ignores the `filename` option of `chrome.downloads.download` (which used to produce blob-UUID file names), so downloads are issued through an anchor `download` attribute with a self-contained data URL instead
 - **Fullscreen report detection fix** — the content script is now also injected into the cross-origin report iframe (`*.web-sandbox.oaiusercontent.com`), fixing the "没有识别到当前全屏报告" failure on fullscreen reports
 - **Fast structured export path** — the report is rebuilt from the page's embedded data stream in seconds, preserving original LaTeX delimiters and the full citation map; the slow per-citation carousel DOM walk only runs as a fallback
+- **Correct report selection in multi-report conversations** — when a conversation contains several Deep Research reports, the payload matching the currently open report's title is selected (visible frames preferred), instead of always exporting the first report
 - **Clean citation rendering and numbering** — citations are exported as `[[N](url)]`, rendering as `[1][2][3]` without triggering display-math renderers or Obsidian wikilinks; ChatGPT's conversation-wide citation numbers (which skip values, e.g. 50 → 103) are renumbered into a contiguous sequence
 - **References section** — a numbered, clickable reference list is appended at the end, matching the inline citation numbers and showing source titles (panel titles when available, URL-derived `host · path words` otherwise)
 - **Regression tests** — 19 Playwright end-to-end tests plus a real-browser download probe (`tests/`)

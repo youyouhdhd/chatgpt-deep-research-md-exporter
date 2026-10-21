@@ -308,23 +308,55 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     return `\n${heading}\n\n${entries.join('\n')}\n`;
   }
 
-  function extractStructuredReport(titlePrefix = '', sourceUrl = location.href) {
-    const payload = extractTransportPayloadsFromScripts().find((item) => (
-      item.includes('report_message')
-      && item.includes('content_references')
-    ));
+  function normalizedReportTitle(value) {
+    return normalizeText(value).replace(/[：:]+$/g, '').toLowerCase();
+  }
 
-    if (!payload) return null;
+  // 同一会话可能包含多份深度调研：内嵌数据流里会有多个 report payload。
+  // 按 matchTitle（当前打开报告的标题）选择对应的一份：
+  // 严格相等优先（同标题多份取最后一份，即最新消息）；否则退回双向包含；
+  // 指定了标题却没有命中时返回 null，让上层走 DOM 路径，避免总是导出第一份。
+  function selectStructuredPayload(matchTitle) {
+    const candidates = extractTransportPayloadsFromScripts()
+      .filter((payload) => payload.includes('report_message') && payload.includes('content_references'))
+      .map((payload) => {
+        const body = extractEmbeddedReportBody(payload);
+        return { payload, body, title: firstHeadingFromMarkdown(body) || '' };
+      })
+      .filter((item) => item.body);
 
-    const markdownBody = extractEmbeddedReportBody(payload);
-    if (!markdownBody) return null;
+    if (candidates.length === 0) return null;
 
-    const references = extractEmbeddedContentReferences(payload);
+    const target = normalizedReportTitle(matchTitle);
+    if (!target) return candidates[0];
+
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      if (normalizedReportTitle(candidates[index].title) === target) return candidates[index];
+    }
+
+    let best = null;
+    for (const candidate of candidates) {
+      const title = normalizedReportTitle(candidate.title);
+      if (!title) continue;
+      if (title.includes(target) || target.includes(title)) {
+        if (!best || normalizedReportTitle(best.title).length < title.length) best = candidate;
+      }
+    }
+    return best;
+  }
+
+  function extractStructuredReport(titlePrefix = '', sourceUrl = location.href, matchTitle = '') {
+    const selected = selectStructuredPayload(matchTitle);
+    if (!selected) return null;
+
+    const markdownBody = selected.body;
+
+    const references = extractEmbeddedContentReferences(selected.payload);
     const referenceMap = buildEmbeddedReferenceMap(references);
     const citationReplacement = replaceEmbeddedCitations(markdownBody, referenceMap);
 
     const title = applyTitlePrefix(
-      firstHeadingFromMarkdown(markdownBody)
+      selected.title
       || normalizeText(document.title.replace(/^ChatGPT\s*-\s*/i, ''))
       || 'Deep Research Report',
       titlePrefix,
@@ -2226,6 +2258,7 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       const result = extractStructuredReport(
         message?.titlePrefix || 'gpt-',
         message?.sourceUrl || location.href,
+        message?.matchTitle || '',
       );
       sendResponse({ ok: Boolean(result), result });
       return undefined;
@@ -2236,9 +2269,15 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     }
     if (message?.type === 'DEEP_RESEARCH_REPORT_HEADING') {
       // 供快路径比对当前打开的报告标题；只做轻量 DOM 查询，不触碰 citation 轮播。
+      // visible 标记报告 frame 是否真实可见——同一会话多份报告时，未打开的旧报告
+      // iframe 仍可能挂在 DOM 上（视口为 0），不能让它抢先成为匹配目标。
       const root = isDirectConversationPage() ? findReportRootFromFullscreenLayer() : findReportRoot();
       const heading = root ? (findTitleElement(root) || root.querySelector('h1')) : null;
-      sendResponse({ ok: true, heading: normalizeText(heading?.textContent || '') });
+      sendResponse({
+        ok: true,
+        heading: normalizeText(heading?.textContent || ''),
+        visible: !document.hidden && window.innerWidth > 0 && window.innerHeight > 0,
+      });
       return undefined;
     }
     if (message?.type !== 'DEEP_RESEARCH_EXPORT_MARKDOWN') return undefined;
