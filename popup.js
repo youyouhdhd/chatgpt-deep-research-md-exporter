@@ -61,7 +61,7 @@ const MESSAGES = {
     error_tab: 'No readable active tab was found.',
     error_page: 'Please open a Deep Research report in a ChatGPT conversation first.',
     error_fast_mode_missed: 'Fast mode found no embedded data matching the open report. Try Auto or DOM-only mode.',
-    error_fast_no_payload: 'Fast mode: this page embeds no report data at all (recent ChatGPT pages dropped it). Use Auto or DOM-only mode.',
+    error_fast_no_payload: 'Fast mode could not read the open report data. Reload this conversation, reopen the report, and retry, or use Auto / DOM-only mode.',
     error_stale_page: 'This page was opened before the extension reloaded. Refresh the ChatGPT tab (F5) and try again.',
     generic_export_failed: 'Export failed.',
     generic_download_failed: 'Download failed.',
@@ -101,7 +101,7 @@ const MESSAGES = {
     error_tab: '没有可用的当前标签页。',
     error_page: '请先进入具体 ChatGPT 对话并打开 Deep Research 全屏报告。',
     error_fast_mode_missed: '快速模式没有匹配到当前打开报告的内嵌数据。可改用“自动”或“仅 DOM”模式重试。',
-    error_fast_no_payload: '快速模式：此页面完全没有内嵌报告数据（新版 ChatGPT 页面已不再内嵌，属正常现象）。请使用“自动”或“仅 DOM”模式。',
+    error_fast_no_payload: '快速模式未能读取当前报告数据。请刷新对话、重新打开报告后重试，或使用“自动”/“仅 DOM”模式。',
     error_stale_page: '页面在扩展重载前就已打开，内容脚本已失联。请刷新 ChatGPT 页面（F5）后重试。',
     generic_export_failed: '导出失败。',
     generic_download_failed: '下载失败。',
@@ -378,50 +378,53 @@ function pickOpenHeadingEntry(headingEntries) {
   ) || null;
 }
 
-async function tryStructuredFastPath(tab, message, openEntry, trace) {
+async function tryStructuredFastPath(tab, message, openEntry, trace, reportFrameIds = []) {
   if (!openEntry) {
     trace.push({ step: 'fast-reject', reason: 'no-open-heading' });
     return null;
   }
 
-  let structured = null;
-  try {
-    structured = await chrome.tabs.sendMessage(tab.id, {
-      type: 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT',
-      titlePrefix: message?.titlePrefix,
-      sourceUrl: message?.sourceUrl,
-      matchTitle: openEntry.heading,
-    }, { frameId: 0 });
-  } catch (error) {
-    trace.push({ step: 'fast-reject', reason: 'probe-error', matchTitle: openEntry.heading, error: String(error?.message || error) });
-    return null;
-  }
-  if (!structured?.ok || !structured?.result?.markdown) {
-    trace.push({ step: 'fast-reject', reason: structured?.ok ? 'no-markdown' : 'no-structured-result', matchTitle: openEntry.heading, error: structured?.error || '' });
-    return null;
-  }
+  for (const frameId of new Set([0, ...reportFrameIds])) {
+    let structured = null;
+    try {
+      structured = await chrome.tabs.sendMessage(tab.id, {
+        type: 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT',
+        titlePrefix: message?.titlePrefix,
+        sourceUrl: message?.sourceUrl,
+        matchTitle: openEntry.heading,
+      }, { frameId });
+    } catch (error) {
+      trace.push({ step: 'fast-reject', frameId, reason: 'probe-error', matchTitle: openEntry.heading, error: String(error?.message || error) });
+      continue;
+    }
+    if (!structured?.ok || !structured?.result?.markdown) {
+      trace.push({ step: 'fast-reject', frameId, reason: structured?.ok ? 'no-markdown' : 'no-structured-result', matchTitle: openEntry.heading, error: structured?.error || '' });
+      continue;
+    }
 
-  // citation 映射未命中时 payload 数据不完整，交给 DOM 路径兜底。
-  const citationCount = Number(structured.result.citationCount) || 0;
-  if (citationCount === 0) {
-    trace.push({ step: 'fast-reject', reason: 'zero-citations', matchTitle: openEntry.heading, structuredTitle: structured.result.title });
-    return null;
-  }
+    // citation 映射未命中时 payload 数据不完整，交给 DOM 路径兜底。
+    const citationCount = Number(structured.result.citationCount) || 0;
+    if (citationCount === 0) {
+      trace.push({ step: 'fast-reject', reason: 'zero-citations', matchTitle: openEntry.heading, structuredTitle: structured.result.title });
+      continue;
+    }
 
-  const prefix = String(message?.titlePrefix || '').trim();
-  const rawTitle = String(structured.result.title || '');
-  const candidate = prefix && rawTitle.startsWith(prefix) ? rawTitle.slice(prefix.length) : rawTitle;
-  if (!normalizedCompareText(candidate)) {
-    trace.push({ step: 'fast-reject', reason: 'empty-candidate', structuredTitle: rawTitle });
-    return null;
+    const prefix = String(message?.titlePrefix || '').trim();
+    const rawTitle = String(structured.result.title || '');
+    const candidate = prefix && rawTitle.startsWith(prefix) ? rawTitle.slice(prefix.length) : rawTitle;
+    if (!normalizedCompareText(candidate)) {
+      trace.push({ step: 'fast-reject', reason: 'empty-candidate', structuredTitle: rawTitle });
+      continue;
+    }
+    // 双保险：选中的 payload 标题必须仍与打开的报告标题对应。
+    if (!titlesReferToSameReport(candidate, openEntry.heading)) {
+      trace.push({ step: 'fast-reject', reason: 'title-mismatch', matchTitle: openEntry.heading, structuredTitle: candidate });
+      continue;
+    }
+    trace.push({ step: 'fast-accept', frameId, matchTitle: openEntry.heading, structuredTitle: candidate });
+    return structured;
   }
-  // 双保险：选中的 payload 标题必须仍与打开的报告标题对应。
-  if (!titlesReferToSameReport(candidate, openEntry.heading)) {
-    trace.push({ step: 'fast-reject', reason: 'title-mismatch', matchTitle: openEntry.heading, structuredTitle: candidate });
-    return null;
-  }
-  trace.push({ step: 'fast-accept', matchTitle: openEntry.heading, structuredTitle: candidate });
-  return structured;
+  return null;
 }
 
 let lastDebugLog = null;
@@ -545,11 +548,11 @@ async function sendExportMessageInner(tab, message, trace) {
       throw new Error(t('error_stale_page'));
     }
     if (exportMode !== 'slow') {
-      const fastResponse = await tryStructuredFastPath(tab, message, openEntry, trace);
+      const fastResponse = await tryStructuredFastPath(tab, message, openEntry, trace, openFrameIds);
       if (fastResponse) return fastResponse;
       const structuredTitles = await traceStructuredTitles(tab, trace);
       if (exportMode === 'fast') {
-        // 区分两种失败：页面根本没有内嵌数据（新版架构，正常现象）vs 有数据但没匹配上。
+        // 脚本未命中不代表报告没有数据；沙箱运行时入口也可能尚未就绪。
         if (Array.isArray(structuredTitles) && structuredTitles.length === 0) {
           throw new Error(t('error_fast_no_payload'));
         }

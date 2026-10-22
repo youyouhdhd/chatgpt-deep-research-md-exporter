@@ -1035,6 +1035,108 @@ x^2 + y^2
         self.assertEqual(first["result"]["title"], "gpt-第一份调研报告")
         self.assertIn(r"[[1](https://example.com/first-source)]", first["result"]["markdown"])
 
+    def test_runtime_report_bridge_exports_raw_markdown_and_matching_references(self):
+        marker = '\ue200cite\ue202turn0search0\ue201'
+        markdown = '# Runtime report\n\nExact \\newcommand{\\name}{value} and \\[ E=mc^2 \\].\n\n' + marker
+        self.page.route('**/*', lambda route: route.fulfill(
+            content_type='text/html', body='<html><head></head><body></body></html>'
+        ))
+        self.page.route('**/page-bridge.js', lambda route: route.fulfill(
+            content_type='text/javascript', body=(ROOT / 'page-bridge.js').read_text(encoding='utf-8')
+        ))
+        self.page.add_init_script('''
+            window.chrome = { runtime: {
+              getURL: () => 'https://chatgpt.com/page-bridge.js',
+              onMessage: { addListener: listener => window.__exportListener = listener }
+            }};
+        ''')
+        self.page.goto(TARGET_URL)
+        self.page.evaluate('''message => {
+          window.openai = {toolResponseMetadata: {venus_widget_state: {report_message: message}}};
+        }''', {
+            'content': {'parts': [markdown]},
+            'metadata': {'content_references': [
+                {'matched_text': marker, 'safe_urls': ['https://example.com/runtime', 'javascript:alert(1)']},
+            ]},
+        })
+        self.page.add_script_tag(path=str(CONTENT_SCRIPT))
+
+        def export(title):
+            return self.page.evaluate('''matchTitle => new Promise(resolve => {
+              window.__exportListener({type: 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT',
+                matchTitle, titlePrefix: 'gpt-'}, null, resolve);
+            })''', title)
+
+        response = export('Runtime report')
+        self.assertTrue(response['ok'], response)
+        result = response['result']
+        self.assertEqual(result['title'], 'gpt-Runtime report')
+        self.assertEqual(result['citationCount'], 1)
+        self.assertIn('Exact \\newcommand{\\name}{value} and \\[ E=mc^2 \\].', result['markdown'])
+        self.assertIn('[[1](https://example.com/runtime)]', result['markdown'])
+        self.assertNotIn('javascript:', result['markdown'])
+        self.assertNotIn(marker, result['markdown'])
+        mismatch = export('Another report')
+        self.assertFalse(mismatch['ok'])
+        self.assertEqual(json.loads(mismatch['error'])['bodyLength'], len(markdown))
+        self.assertNotIn(markdown, mismatch['error'])
+        self.assertEqual(self.page.locator('[data-deep-research-exporter-result]').count(), 0)
+        self.page.evaluate('window.openai = undefined')
+        missing = export('Runtime report')
+        self.assertFalse(missing['ok'])
+        self.assertFalse(json.loads(missing['error'])['hasOpenai'])
+
+        # Current ChatGPT keeps only progress in initial metadata; the completed
+        # report and citations live together in the rendered component's props.
+        self.page.evaluate('''data => {
+          window.openai = {toolResponseMetadata: {venus_widget_state: {status: 'completed'}}};
+          const heading = document.createElement('h1');
+          heading.textContent = 'Runtime report';
+          document.body.appendChild(heading);
+          const reportFiber = {memoizedProps: {
+            report: data.markdown,
+            contentReferences: [{matched_text: data.marker, safe_urls: ['https://example.com/rendered']}]
+          }, return: null};
+          heading.__reactFiber$test = {memoizedProps: {children: 'Runtime report'}, return: reportFiber};
+        }''', {'markdown': markdown, 'marker': marker})
+        rendered = export('Runtime report')
+        self.assertTrue(rendered['ok'], rendered)
+        self.assertIn('[[1](https://example.com/rendered)]', rendered['result']['markdown'])
+        self.assertIn('Exact \\newcommand{\\name}{value}', rendered['result']['markdown'])
+        self.assertEqual(rendered['result']['citationCount'], 1)
+        mismatch = export('Another report')
+        status = json.loads(mismatch['error'])
+        self.assertFalse(mismatch['ok'])
+        self.assertEqual(status['source'], 'rendered-report-props')
+        self.assertEqual(status['referenceCount'], 1)
+        self.assertNotIn(markdown, mismatch['error'])
+
+    def test_fast_path_reads_matching_report_frame_when_top_level_has_no_data(self):
+        self.page.route('**/*', lambda route: route.fulfill(
+            content_type='text/html', body=(ROOT / 'popup.html').read_text(encoding='utf-8')
+        ))
+        self.page.goto('https://example.com/popup.html')
+        self.page.evaluate('''() => {
+          window.chrome = { storage: {local: {get: async () => ({}), set: async () => {}}} };
+        }''')
+        self.page.add_script_tag(path=str(ROOT / 'popup.js'))
+        result = self.page.evaluate('''async () => {
+          const probes = [];
+          chrome.tabs = {sendMessage: async (_id, message, options) => {
+            probes.push(options.frameId);
+            return options.frameId === 9
+              ? {ok: true, result: {title: 'gpt-Runtime report', markdown: '# Report', citationCount: 1}}
+              : {ok: false};
+          }};
+          const trace = [];
+          const response = await tryStructuredFastPath({id: 1}, {titlePrefix: 'gpt-'},
+            {heading: 'Runtime report', frameId: 9}, trace, [9]);
+          return {response, probes, trace};
+        }''')
+        self.assertTrue(result['response']['ok'], result)
+        self.assertEqual(result['probes'], [0, 9])
+        self.assertEqual(result['trace'][-1]['frameId'], 9)
+
     def test_fast_path_prefers_matching_structured_payload(self):
         self.page.add_init_script(
             f"""
@@ -1200,7 +1302,7 @@ x^2 + y^2
         self.page.locator("#startButton").click()
         self.page.wait_for_function("!document.querySelector('#startButton').disabled")
 
-        self.assertEqual(self.page.evaluate("window.__structuredProbes"), [0])
+        self.assertEqual(self.page.evaluate("window.__structuredProbes"), [0, 7])
         self.assertEqual(self.page.evaluate("window.__exportFrames"), [])
         status_text = self.page.locator("#status").inner_text()
         self.assertIn("Fast mode", status_text)

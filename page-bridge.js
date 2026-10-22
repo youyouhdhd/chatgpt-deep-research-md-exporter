@@ -19,6 +19,52 @@
     return values.filter(Boolean);
   }
 
+  function renderedReport() {
+    for (const heading of document.querySelectorAll('h1')) {
+      const key = Object.keys(heading).find((name) => name.startsWith('__reactFiber$'));
+      let fiber = key ? heading[key] : null;
+      // The report component owns both the original Markdown and its citation map.
+      for (let depth = 0; fiber && depth < 100; depth += 1, fiber = fiber.return) {
+        const props = fiber.memoizedProps;
+        if (typeof props?.report === 'string' && Array.isArray(props.contentReferences)) {
+          return { body: props.report, references: props.contentReferences };
+        }
+      }
+    }
+    return null;
+  }
+
+  function reportData(statusOnly = false) {
+    const rendered = renderedReport();
+    const message = window.openai?.widgetState?.report_message
+      || window.openai?.toolResponseMetadata?.venus_widget_state?.report_message;
+    const parts = message?.content?.parts;
+    const body = rendered?.body || (Array.isArray(parts)
+      ? parts.filter((part) => typeof part === 'string').join('\n')
+      : message?.text);
+    const references = rendered?.references || message?.metadata?.content_references;
+    if (statusOnly) return {
+      hasOpenai: Boolean(window.openai),
+      metadataKeys: Object.keys(window.openai?.toolResponseMetadata || {}),
+      widgetKeys: Object.keys(window.openai?.toolResponseMetadata?.venus_widget_state || {}),
+      reportKeys: Object.keys(message || {}),
+      bodyLength: typeof body === 'string' ? body.length : 0,
+      contentType: typeof message?.content,
+      source: rendered ? 'rendered-report-props' : 'widget-state',
+      referenceCount: Array.isArray(references) ? references.length : 0,
+    };
+    return {
+      ok: typeof body === 'string' && body.length > 0,
+      body: typeof body === 'string' ? body : '',
+      references: Array.isArray(references)
+        ? references.map((item) => ({
+          matchedText: item?.matched_text,
+          urls: item?.safe_urls,
+        }))
+        : [],
+    };
+  }
+
   function collectUrls(root) {
     const urls = new Set();
     const seen = new Set();
@@ -99,7 +145,11 @@
       const action = element.getAttribute(ACTION_ATTR);
       let result;
       try {
-        if (action === 'click') {
+        if (action === 'report-data') {
+          result = reportData();
+        } else if (action === 'report-status') {
+          result = reportData(true);
+        } else if (action === 'click') {
           result = { ok: invokeReactClick(element) };
         } else if (action === 'hover') {
           result = { ok: invokeReactHandlers(element, ['onPointerMove', 'onPointerEnter', 'onMouseEnter', 'onFocus']) };

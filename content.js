@@ -345,13 +345,30 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     return best;
   }
 
-  function extractStructuredReport(titlePrefix = '', sourceUrl = location.href, matchTitle = '') {
-    const selected = selectStructuredPayload(matchTitle);
+  async function extractStructuredReport(titlePrefix = '', sourceUrl = location.href, matchTitle = '') {
+    let selected = selectStructuredPayload(matchTitle);
+    if (!selected) {
+      const data = await requestPageBridge(document.documentElement, 'report-data');
+      if (data?.ok && typeof data.body === 'string') {
+        const title = firstHeadingFromMarkdown(data.body);
+        const target = normalizedReportTitle(matchTitle);
+        if (!target || normalizedReportTitle(title) === target) {
+          selected = { body: data.body, title, references: data.references };
+        }
+      }
+    }
     if (!selected) return null;
 
     const markdownBody = selected.body;
 
-    const references = extractEmbeddedContentReferences(selected.payload);
+    const references = selected.payload
+      ? extractEmbeddedContentReferences(selected.payload)
+      : (Array.isArray(selected.references) ? selected.references : [])
+        .filter((item) => typeof item?.matchedText === 'string' && Array.isArray(item.urls))
+        .map((item) => ({
+          matchedText: item.matchedText,
+          urls: item.urls.filter((url) => typeof url === 'string' && /^https?:\/\//i.test(url)),
+        }));
     const referenceMap = buildEmbeddedReferenceMap(references);
     const citationReplacement = replaceEmbeddedCitations(markdownBody, referenceMap);
 
@@ -375,7 +392,7 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
     const warnings = [];
 
     if (citationReplacement.citationCount === 0) {
-      warnings.push('识别到了内嵌 report，但没有命中 citation 映射。');
+      warnings.push('识别到了结构化报告，但没有命中 citation 映射。');
     }
 
     return {
@@ -2194,7 +2211,7 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
   async function exportMarkdown(titlePrefix = '', sourceUrl = location.href, includeDiagnostics = false) {
     // 分享页优先读取内嵌 payload；具体聊天页优先导出用户当前打开的报告。
     if (!isDirectConversationPage()) {
-      const structured = extractStructuredReport(titlePrefix, sourceUrl);
+      const structured = await extractStructuredReport(titlePrefix, sourceUrl);
       if (structured) {
         return structured;
       }
@@ -2206,7 +2223,7 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       if (directConversation) {
         throw new Error(`没有识别到当前全屏报告。请先将目标报告打开为全屏视图，再点击开始识别。${describeFullscreenDiagnostics()}`);
       }
-      const structured = extractStructuredReport(titlePrefix, sourceUrl);
+      const structured = await extractStructuredReport(titlePrefix, sourceUrl);
       if (structured) return structured;
       throw new Error('没有识别到 Deep Research 报告主体。请先打开全屏报告页。');
     }
@@ -2315,13 +2332,20 @@ if (!globalThis.__deepResearchMarkdownExporterLoaded) {
       return true;
     }
     if (message?.type === 'DEEP_RESEARCH_EXPORT_STRUCTURED_REPORT') {
-      const result = extractStructuredReport(
+      extractStructuredReport(
         message?.titlePrefix || 'gpt-',
         message?.sourceUrl || location.href,
         message?.matchTitle || '',
-      );
-      sendResponse({ ok: Boolean(result), result });
-      return undefined;
+      ).then(async (result) => sendResponse({
+        ok: Boolean(result),
+        result,
+        error: result ? '' : JSON.stringify(
+          await requestPageBridge(document.documentElement, 'report-status')
+          || { bridgeUnavailable: true },
+        ),
+      }))
+        .catch((error) => sendResponse({ ok: false, error: String(error) }));
+      return true;
     }
     if (message?.type === 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES') {
       // 诊断用：列出当前页面内嵌数据流里所有报告 payload 的标题与正文长度。
