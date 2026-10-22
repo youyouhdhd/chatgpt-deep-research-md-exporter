@@ -6,7 +6,7 @@
 
 ## 本 Fork 的更新
 
-本 fork（v0.2.22）基于原版插件（[qpwm06/chatgpt-deep-research-md-exporter](https://github.com/qpwm06/chatgpt-deep-research-md-exporter)，v0.2.5）增强，主要区别：
+本 fork（v0.2.23）基于原版插件（[qpwm06/chatgpt-deep-research-md-exporter](https://github.com/qpwm06/chatgpt-deep-research-md-exporter)，v0.2.5）增强，主要区别：
 
 - **可用的下载与正确文件名** — 下载文件以插件识别出的报告标题 + 本地时间命名，如 `gpt-电子围栏技术调研报告_2026-10-15_11-02.md`；Chrome 会忽略 `chrome.downloads.download` 的 `filename` 参数（导致文件名变成 blob UUID 乱码），因此改用 anchor `download` 属性 + 自包含 data URL 实现可靠命名
 - **全屏报告识别修复** — 内容脚本注入扩展到跨域报告 iframe（`*.web-sandbox.oaiusercontent.com`），解决"没有识别到当前全屏报告"的识别失败

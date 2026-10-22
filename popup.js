@@ -61,6 +61,7 @@ const MESSAGES = {
     error_tab: 'No readable active tab was found.',
     error_page: 'Please open a Deep Research report in a ChatGPT conversation first.',
     error_fast_mode_missed: 'Fast mode found no embedded data matching the open report. Try Auto or DOM-only mode.',
+    error_fast_no_payload: 'Fast mode: this page embeds no report data at all (recent ChatGPT pages dropped it). Use Auto or DOM-only mode.',
     error_stale_page: 'This page was opened before the extension reloaded. Refresh the ChatGPT tab (F5) and try again.',
     generic_export_failed: 'Export failed.',
     generic_download_failed: 'Download failed.',
@@ -100,6 +101,7 @@ const MESSAGES = {
     error_tab: '没有可用的当前标签页。',
     error_page: '请先进入具体 ChatGPT 对话并打开 Deep Research 全屏报告。',
     error_fast_mode_missed: '快速模式没有匹配到当前打开报告的内嵌数据。可改用“自动”或“仅 DOM”模式重试。',
+    error_fast_no_payload: '快速模式：此页面完全没有内嵌报告数据（新版 ChatGPT 页面已不再内嵌，属正常现象）。请使用“自动”或“仅 DOM”模式。',
     error_stale_page: '页面在扩展重载前就已打开，内容脚本已失联。请刷新 ChatGPT 页面（F5）后重试。',
     generic_export_failed: '导出失败。',
     generic_download_failed: '下载失败。',
@@ -443,9 +445,12 @@ async function traceStructuredTitles(tab, trace) {
     const response = await chrome.tabs.sendMessage(tab.id, {
       type: 'DEEP_RESEARCH_LIST_STRUCTURED_TITLES',
     }, { frameId: 0 });
-    trace.push({ step: 'structured-titles', items: response?.items || [] });
+    const items = Array.isArray(response?.items) ? response.items : [];
+    trace.push({ step: 'structured-titles', items });
+    return items;
   } catch (error) {
     trace.push({ step: 'structured-titles', error: String(error?.message || error) });
+    return null;
   }
 }
 
@@ -542,8 +547,12 @@ async function sendExportMessageInner(tab, message, trace) {
     if (exportMode !== 'slow') {
       const fastResponse = await tryStructuredFastPath(tab, message, openEntry, trace);
       if (fastResponse) return fastResponse;
-      await traceStructuredTitles(tab, trace);
+      const structuredTitles = await traceStructuredTitles(tab, trace);
       if (exportMode === 'fast') {
+        // 区分两种失败：页面根本没有内嵌数据（新版架构，正常现象）vs 有数据但没匹配上。
+        if (Array.isArray(structuredTitles) && structuredTitles.length === 0) {
+          throw new Error(t('error_fast_no_payload'));
+        }
         throw new Error(t('error_fast_mode_missed'));
       }
     }
